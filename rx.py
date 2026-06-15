@@ -124,12 +124,15 @@ def read_symbol_bits(warp_gray, symbol_size=SYMBOL_SIZE, border=BORDER):
     _, bw = cv2.threshold(warp_gray, 0, 255,
                           cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if not _debug_saved:
-        import matplotlib.pyplot as plt
+        import os
+        os.makedirs("debug_rx", exist_ok=True)
+
         # Dibujar punto en la primera celda de datos
         debug_color = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
         cv2.rectangle(debug_color, (109, 21), (119, 32), (0,0,255), 2)
-        plt.imsave("C:/Users/Andres D/Documents/Comu/debug_bw.png", 
-                cv2.cvtColor(debug_color, cv2.COLOR_BGR2RGB))
+
+        cv2.imwrite("debug/debug_bw.png", debug_color)
+
         _debug_saved = True
     # en read_symbol_bits, antes del loop
     print(f"Primera posición de datos: {DATA_POSITIONS[0]}")
