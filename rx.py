@@ -19,14 +19,16 @@ CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 
-# Tamaño de la imagen rectificada.
-# Antes estaba en 480. Con 800, cada celda de una grilla 40x40 queda de ~20 px.
+# Imagen rectificada para lectura de grilla.
+# 800 / 40 = 20 px por celda aprox.
 WARP_SIZE = 800
 
-# Estabilidad temporal:
+# Escala de procesamiento.
+# Con 0.5 ya se logró decodificación rápida y estable.
+PROCESS_SCALE = 0.5
+
+# Estabilidad temporal.
 # 1 = procesa una lectura apenas aparece.
-# 2 = exige que la misma grilla se lea igual dos veces seguidas.
-# Para la prueba que ya te funcionó, 1 suele ser mejor.
 REQUIRED_STABLE = 1
 
 # Debug / consola
@@ -34,6 +36,20 @@ DEBUG_VERBOSE = False
 PRINT_INVALID_FRAMES = False
 PRINT_CRC_ERRORS = True
 SAVE_DEBUG_IMAGE = True
+
+# Activar cálculo de BER contra texto de referencia conocido.
+ENABLE_BER_EVALUATION = True
+
+# Texto esperado. Debe ser exactamente el mismo texto que transmite tx_final.py.
+EXPECTED_TEXT = (
+    "La vision artificial permite interpretar imagenes mediante algoritmos "
+    "que detectan patrones, formas y relaciones espaciales. Los sistemas "
+    "modernos utilizan transformaciones geometricas, segmentacion y analisis "
+    "de contornos para identificar objetos incluso bajo rotacion o perspectiva. "
+    "Los fiduciales son referencias visuales usadas para calcular orientacion, "
+    "escala y posicion, facilitando la reconstruccion proyectiva y la extraccion "
+    "robusta de informacion contenida dentro de una region determinada."
+)
 
 # Cabecera, igual que Tx
 PREAMBLE = 0xDEAD
@@ -56,21 +72,25 @@ def build_reserved_mask(N=SYMBOL_SIZE, FQ=FQ):
 
 
 RESERVED_MASK = build_reserved_mask()
+
 DATA_POSITIONS = [
     (r, c)
     for r in range(SYMBOL_SIZE)
     for c in range(SYMBOL_SIZE)
     if not RESERVED_MASK[r, c]
 ]
+
 DATA_CELLS = len(DATA_POSITIONS)
 MAX_PAYLOAD_BITS_PER_FRAME = (DATA_CELLS - HEADER_BITS) // 2
 
 
-# ─────────────────────────── CRC-16 (CCITT-FALSE) ────────────────────────────
+# ─────────────────────────── CRC-16 CCITT-FALSE ──────────────────────────────
 def crc16(bits: list) -> int:
     crc = 0xFFFF
+
     for i in range(0, len(bits), 8):
         chunk = bits[i:i + 8]
+
         if len(chunk) < 8:
             chunk += [0] * (8 - len(chunk))
 
@@ -79,18 +99,28 @@ def crc16(bits: list) -> int:
             byte_val = (byte_val << 1) | int(b)
 
         crc ^= byte_val << 8
+
         for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc = crc << 1
+
         crc &= 0xFFFF
+
     return crc
 
 
-# ─────────────────────────── DECODIFICACIÓN ──────────────────────────────────
+# ─────────────────────────── DECODIFICACIÓN Y MÉTRICAS ───────────────────────
 def bits_to_int(bits: list) -> int:
     val = 0
     for b in bits:
         val = (val << 1) | int(b)
     return val
+
+
+def text_to_bits(text: str) -> list[int]:
+    return [int(b) for char in text for b in format(ord(char), "08b")]
 
 
 def manchester_decode(bits: list) -> Optional[list]:
@@ -99,8 +129,7 @@ def manchester_decode(bits: list) -> Optional[list]:
       1 -> 10
       0 -> 01
 
-    Si aparece 00 o 11, la trama está corrupta y se descarta.
-    Antes el código ignoraba esos pares, lo cual podía desalinear el payload.
+    Si aparece 00 o 11, la trama se considera corrupta.
     """
     decoded = []
 
@@ -108,7 +137,8 @@ def manchester_decode(bits: list) -> Optional[list]:
         return None
 
     for i in range(0, len(bits), 2):
-        a, b = bits[i], bits[i + 1]
+        a = bits[i]
+        b = bits[i + 1]
 
         if a == 1 and b == 0:
             decoded.append(1)
@@ -122,29 +152,76 @@ def manchester_decode(bits: list) -> Optional[list]:
 
 def bits_to_text(bits: list) -> str:
     chars = []
+
     for i in range(0, len(bits) - 7, 8):
         val = bits_to_int(bits[i:i + 8])
+
         if val == 0:
             break
+
         try:
             chars.append(chr(val))
         except ValueError:
             pass
+
     return "".join(chars)
+
+
+def compute_ber(expected_bits: list[int], received_bits: list[int]) -> dict:
+    """
+    Calcula BER comparando bits esperados contra bits recibidos.
+
+    Si las longitudes son diferentes, los bits faltantes o sobrantes
+    se cuentan como errores. Esto permite reportar BER de forma conservadora.
+    """
+    max_len = max(len(expected_bits), len(received_bits))
+
+    if max_len == 0:
+        return {
+            "expected_bits": len(expected_bits),
+            "received_bits": len(received_bits),
+            "compared_bits": 0,
+            "bit_errors": 0,
+            "ber": 0.0,
+        }
+
+    bit_errors = 0
+
+    for i in range(max_len):
+        expected = expected_bits[i] if i < len(expected_bits) else None
+        received = received_bits[i] if i < len(received_bits) else None
+
+        if expected != received:
+            bit_errors += 1
+
+    ber = bit_errors / max_len
+
+    return {
+        "expected_bits": len(expected_bits),
+        "received_bits": len(received_bits),
+        "compared_bits": max_len,
+        "bit_errors": bit_errors,
+        "ber": ber,
+    }
 
 
 def parse_frame(all_bits: list):
     """
-    Separa la trama en cabecera cruda y payload Manchester.
+    Separa una trama en:
+      PREAMBLE
+      N_TOTAL
+      N_FRAME
+      N_PAYLOAD
+      CRC
+      PAYLOAD Manchester
 
-    Devuelve:
-      dict con campos de trama si la estructura es válida.
-      None si preámbulo/cabecera/payload son inválidos.
+    Devuelve None si la trama no es válida.
     """
     if len(all_bits) < HEADER_BITS:
         return None
 
     ptr = 0
+
     preamble = bits_to_int(all_bits[ptr:ptr + PREAMBLE_BITS])
     ptr += PREAMBLE_BITS
 
@@ -160,12 +237,12 @@ def parse_frame(all_bits: list):
     crc_rx = bits_to_int(all_bits[ptr:ptr + CHECKSUM_BITS])
     ptr += CHECKSUM_BITS
 
-    # 1) Validar preámbulo
+    # Validar preámbulo
     if preamble != PREAMBLE:
         return None
 
-    # 2) Validar cabecera para descartar casos absurdos:
-    #    FRAME #8/7, FRAME #64/775, FRAME #7/32775, etc.
+    # Validar cabecera para evitar casos absurdos:
+    # FRAME #8/7, FRAME #64/775, FRAME #7/32775, etc.
     if n_total <= 0 or n_total > MAX_TOTAL_FRAMES:
         return None
 
@@ -175,8 +252,8 @@ def parse_frame(all_bits: list):
     if n_payload <= 0 or n_payload > MAX_PAYLOAD_BITS_PER_FRAME:
         return None
 
-    # 3) Validar que el payload Manchester quepa en las celdas disponibles
     needed_cells = n_payload * 2
+
     if ptr + needed_cells > len(all_bits):
         return None
 
@@ -189,9 +266,8 @@ def parse_frame(all_bits: list):
     if len(payload_bits) != n_payload:
         return None
 
-    # 4) Verificar CRC
     crc_calc = crc16(payload_bits)
-    crc_ok = (crc_calc == crc_rx)
+    crc_ok = crc_calc == crc_rx
 
     return {
         "n_total": n_total,
@@ -212,8 +288,7 @@ def read_symbol_bits(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
     """
     Lee la grilla rectificada y devuelve los bits de DATA_POSITIONS.
 
-    border=0 porque la homografía actual rectifica usando los fiduciales,
-    no el borde blanco externo completo del transmisor.
+    border=0 porque la homografía actual ya rectifica directamente el símbolo.
     """
     global _debug_saved
 
@@ -221,7 +296,6 @@ def read_symbol_bits(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
     total_cells = symbol_size
     cell_px = H / total_cells
 
-    # Umbral global adaptativo por Otsu sobre la imagen ya rectificada.
     _, bw = cv2.threshold(
         warp_gray,
         0,
@@ -234,10 +308,10 @@ def read_symbol_bits(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
 
         debug_color = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
 
-        # Marca la primera celda de datos realmente usada.
         first_row, first_col = DATA_POSITIONS[0]
         rr = first_row + border
         cc = first_col + border
+
         r0 = int(rr * cell_px)
         r1 = int((rr + 1) * cell_px)
         c0 = int(cc * cell_px)
@@ -312,10 +386,12 @@ def detect_fiducials(binary, contours, hierarchy):
             continue
 
         child_idx = hier[i][2]
+
         if child_idx == -1 or not is_quad(contours[child_idx]):
             continue
 
         gc_idx = hier[child_idx][2]
+
         if gc_idx == -1 or not is_quad(contours[gc_idx]):
             continue
 
@@ -326,10 +402,12 @@ def detect_fiducials(binary, contours, hierarchy):
             continue
 
         aspect = w / h
+
         if not (0.4 < aspect < 2.5):
             continue
 
         area_rect = w * h
+
         if area_rect <= 0:
             continue
 
@@ -350,7 +428,7 @@ def detect_fiducials(binary, contours, hierarchy):
 
 def order_corners(fiducials):
     """
-    Ordena las esquinas aproximadas de los cuatro fiduciales:
+    Ordena los cuatro fiduciales como:
       TL, TR, BR, BL
     """
     centers = np.array([f["center"] for f in fiducials])
@@ -373,17 +451,20 @@ def order_corners(fiducials):
 
 # ─────────────────────────── CLASE RECEPTOR ──────────────────────────────────
 class Rx:
-    def __init__(self, scale=0.5, warp_size=WARP_SIZE):
+    def __init__(self, scale=PROCESS_SCALE, warp_size=WARP_SIZE):
         self.scale = scale
         self.warp_size = warp_size
         self.cap = None
-        self.reset()
+
+        # Inicializa estado sin imprimir todavía.
+        self.reset(announce=False)
 
     # ── Estado ────────────────────────────────────────────────────────────────
-    def reset(self):
+    def reset(self, announce=True):
         self._frame_store = {}
         self._n_total_expected = None
         self._decoded_text = ""
+        self._decoded_bits = []
 
         self._last_symbol_bits = None
         self._stable_count = 0
@@ -391,11 +472,20 @@ class Rx:
         self._processed_symbol_ids = set()
 
         self._last_event_msg = ""
+
+        # Métricas de tiempo
+        self._reset_time = time.time()
         self._first_ok_time = None
         self._complete_time = None
         self._final_reported = False
 
-        print("Decoder reiniciado.")
+        # Métricas de BER
+        self._ber_metrics = None
+        self._text_match = None
+
+        if announce:
+            print("Decoder reiniciado.")
+            print("Cronómetro RX iniciado desde reset.")
 
     # ── Cámara ────────────────────────────────────────────────────────────────
     def open_camera(self, cam_id=0):
@@ -408,7 +498,6 @@ class Rx:
         if not self.cap.isOpened():
             raise RuntimeError(f"No se pudo abrir la cámara id={cam_id}")
 
-        # Configuración sugerida para bajar carga frente a 1920x1080.
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
@@ -418,7 +507,7 @@ class Rx:
         for _ in range(10):
             self.cap.read()
 
-        # Estas propiedades dependen de la cámara/driver.
+        # Estas propiedades dependen de cada cámara/driver.
         # Si el driver las ignora, no pasa nada.
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
         self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)
@@ -439,7 +528,12 @@ class Rx:
         print(f"Exposure:   {self.cap.get(cv2.CAP_PROP_EXPOSURE)}")
         print(f"Backend:    {self.cap.getBackendName()}")
         print(f"Warp size:  {self.warp_size}x{self.warp_size}")
+        print(f"Scale:      {self.scale}")
         print(f"Estabilidad requerida: {self._required_stable}")
+
+        if ENABLE_BER_EVALUATION:
+            print("BER:        habilitado contra texto de referencia local")
+            print(f"Referencia: {len(EXPECTED_TEXT)} caracteres")
 
         cv2.namedWindow("Camara", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Símbolo", cv2.WINDOW_NORMAL)
@@ -455,6 +549,54 @@ class Rx:
             self.cap.release()
         cv2.destroyAllWindows()
 
+    # ── Métricas ──────────────────────────────────────────────────────────────
+    def _time_metrics(self):
+        if self._complete_time is None:
+            return None, None
+
+        tiempo_total = self._complete_time - self._reset_time
+
+        if self._first_ok_time is not None:
+            tiempo_desde_primer_ok = self._complete_time - self._first_ok_time
+        else:
+            tiempo_desde_primer_ok = None
+
+        return tiempo_total, tiempo_desde_primer_ok
+
+    def _update_ber_metrics(self):
+        if not ENABLE_BER_EVALUATION:
+            return
+
+        expected_bits = text_to_bits(EXPECTED_TEXT)
+        received_bits = self._decoded_bits[:len(expected_bits)]
+
+        self._ber_metrics = compute_ber(expected_bits, received_bits)
+        self._text_match = (self._decoded_text == EXPECTED_TEXT)
+
+    def _print_final_metrics(self):
+        tiempo_total, tiempo_desde_primer_ok = self._time_metrics()
+
+        if tiempo_total is not None:
+            print(f"\nTiempo total desde reset RX: {tiempo_total:.2f} s")
+
+        if tiempo_desde_primer_ok is not None:
+            print(f"Tiempo desde primer FRAME OK: {tiempo_desde_primer_ok:.2f} s")
+
+        if ENABLE_BER_EVALUATION and self._ber_metrics is not None:
+            m = self._ber_metrics
+            print("\nMétricas BER:")
+            print(f"  Caracteres esperados: {len(EXPECTED_TEXT)}")
+            print(f"  Caracteres recibidos: {len(self._decoded_text)}")
+            print(f"  Bits esperados:       {m['expected_bits']}")
+            print(f"  Bits recibidos:       {m['received_bits']}")
+            print(f"  Bits comparados:      {m['compared_bits']}")
+            print(f"  Errores de bit:       {m['bit_errors']}")
+            print(f"  BER:                  {m['ber']:.2e}")
+            print(f"  Texto exacto:          {'SI' if self._text_match else 'NO'}")
+
+        if tiempo_total is None:
+            print("\nNo se completó la decodificación del texto.")
+
     # ── Reconstrucción de texto ───────────────────────────────────────────────
     def _try_reconstruct(self):
         if self._n_total_expected is None:
@@ -464,23 +606,26 @@ class Rx:
             return
 
         all_bits = []
+
         for idx in range(self._n_total_expected):
             if idx not in self._frame_store:
                 return
             all_bits.extend(self._frame_store[idx])
 
+        self._decoded_bits = all_bits
         self._decoded_text = bits_to_text(all_bits)
 
         if self._decoded_text and self._complete_time is None:
             self._complete_time = time.time()
+            self._update_ber_metrics()
 
     # ── Pipeline principal ────────────────────────────────────────────────────
     def process_frame(self, frame):
         debug = frame.copy()
 
-        # Para la etapa actual buscamos en toda la imagen.
-        # Más adelante se puede volver a ROI central para mejorar FPS.
+        # Procesamos toda la imagen, pero a escala reducida.
         roi = frame
+
         scaled = cv2.resize(
             roi,
             None,
@@ -524,6 +669,7 @@ class Rx:
         for f in fiducials:
             box_orig = (f["box"] / self.scale + offset).astype(np.int32)
             cv2.drawContours(debug, [box_orig], 0, (0, 255, 0), 2)
+
             c = ((f["center"] / self.scale) + offset).astype(int)
             cv2.circle(debug, tuple(c), 5, (0, 0, 255), -1)
 
@@ -532,11 +678,13 @@ class Rx:
             return debug, None, self._decoded_text
 
         sel = fiducials[:4] if len(fiducials) == 4 else self._best_four(fiducials)
+
         tl, tr, br, bl = order_corners(sel)
 
         pts_orig = (np.array([tl, tr, br, bl]) / self.scale + offset).astype(np.float32)
 
         cv2.polylines(debug, [pts_orig.astype(np.int32)], True, (255, 0, 0), 2)
+
         for p, lbl in zip(pts_orig.astype(int), ["TL", "TR", "BR", "BL"]):
             cv2.circle(debug, tuple(p), 6, (255, 255, 0), -1)
             cv2.putText(
@@ -550,6 +698,7 @@ class Rx:
             )
 
         ws = self.warp_size
+
         dst = np.array(
             [[0, 0], [ws, 0], [ws, ws], [0, ws]],
             dtype=np.float32
@@ -590,14 +739,17 @@ class Rx:
                 if parsed is None:
                     msg = "[FRAME descartado] preámbulo/cabecera inválidos"
                     self._last_event_msg = msg
+
                     if PRINT_INVALID_FRAMES:
                         print(msg)
 
                 elif not parsed["crc_ok"]:
                     nf = parsed["n_frame"]
                     nt = parsed["n_total"]
+
                     msg = f"[FRAME #{nf + 1}/{nt} DESCARTADO] CRC error"
                     self._last_event_msg = msg
+
                     if PRINT_CRC_ERRORS:
                         print(msg)
 
@@ -609,7 +761,10 @@ class Rx:
                         self._first_ok_time = time.time()
 
                     self._n_total_expected = nt
+
+                    # Guardar la trama válida. Si llega repetida, se sobrescribe igual.
                     self._frame_store[nf] = parsed["payload"]
+
                     self._try_reconstruct()
 
                     msg = (
@@ -619,11 +774,23 @@ class Rx:
                         f"texto={len(self._decoded_text)} chars"
                     )
 
-                    if self._complete_time is not None and self._first_ok_time is not None:
-                        elapsed = self._complete_time - self._first_ok_time
-                        msg += f" | tiempo_rx={elapsed:.2f}s"
+                    if self._complete_time is not None:
+                        tiempo_total, tiempo_desde_primer_ok = self._time_metrics()
+
+                        if tiempo_total is not None:
+                            msg += f" | tiempo_total_desde_reset={tiempo_total:.2f}s"
+
+                        if tiempo_desde_primer_ok is not None:
+                            msg += f" | tiempo_desde_primer_frame_ok={tiempo_desde_primer_ok:.2f}s"
+
+                        if self._ber_metrics is not None:
+                            msg += (
+                                f" | BER={self._ber_metrics['ber']:.2e} "
+                                f"| errores_bit={self._ber_metrics['bit_errors']}"
+                            )
 
                     print(msg)
+
                     self._last_event_msg = msg
                     symbol_just_processed = True
 
@@ -667,13 +834,25 @@ class Rx:
 
         if self._last_event_msg:
             color = (0, 255, 0) if just_processed else (180, 255, 180)
+
             cv2.putText(
                 debug,
-                self._last_event_msg[:110],
+                self._last_event_msg[:120],
                 (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 color,
+                2
+            )
+
+        if self._ber_metrics is not None:
+            cv2.putText(
+                debug,
+                f"BER={self._ber_metrics['ber']:.2e} | errores={self._ber_metrics['bit_errors']}",
+                (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
                 2
             )
 
@@ -694,6 +873,7 @@ class Rx:
         Selecciona cuatro fiduciales extremos.
         """
         centers = np.array([f["center"] for f in fiducials])
+
         s = centers.sum(axis=1)
         d = np.diff(centers, axis=1).flatten()
 
@@ -705,6 +885,7 @@ class Rx:
         ]
 
         unique = []
+
         for idx in candidate_indices:
             if idx not in unique:
                 unique.append(idx)
@@ -716,8 +897,7 @@ class Rx:
 
     def _draw_grid(self, img, ws):
         """
-        Dibuja grilla visual sobre la imagen rectificada.
-        Ahora no suma BORDER porque la lectura real usa border=0.
+        Dibuja la grilla visual sobre la imagen rectificada.
         """
         total_cells = SYMBOL_SIZE
         cell_px = ws / total_cells
@@ -734,6 +914,7 @@ class Rx:
             c0 = int(col * cell_px)
             r1 = int((row + 1) * cell_px)
             c1 = int((col + 1) * cell_px)
+
             cv2.rectangle(overlay, (c0, r0), (c1, r1), (255, 100, 0), -1)
 
         cv2.addWeighted(overlay, 0.12, img, 0.88, 0, img)
@@ -743,12 +924,18 @@ class Rx:
 
 # ─────────────────────────── MAIN LOOP ───────────────────────────────────────
 if __name__ == "__main__":
-    rx = Rx(scale=0.5, warp_size=WARP_SIZE)
+    rx = Rx(scale=PROCESS_SCALE, warp_size=WARP_SIZE)
     rx.open_camera(cam_id=0)
 
+    # Este reset ocurre después de abrir cámara.
+    # Así el tiempo_total_desde_reset no incluye la inicialización de cámara.
+    rx.reset()
+
     print("Leyendo... 'q' para salir, 'r' para reiniciar decoder.")
+    print("Tip: presiona 'r' cuando ya tengas la cámara bien apuntada al TX.")
     print("Tip: si no detecta cámara, cambia rx.open_camera(cam_id=0) por 1 o 2.")
-    print("Tip: si hay muchos CRC error, prueba subir delay en TX o mejorar enfoque/brillo.\n")
+    print("Tip: si hay muchos CRC error, mejora enfoque/brillo o sube delay en TX.")
+    print("Tip: para medir formalmente, usa el mismo EXPECTED_TEXT que transmite tx_final.py.\n")
 
     last_time = time.time()
     fps_count = 0
@@ -757,10 +944,12 @@ if __name__ == "__main__":
     try:
         while True:
             frame = rx.read_frame()
+
             if frame is None:
                 break
 
             fps_count += 1
+
             if time.time() - last_time >= 1:
                 print(f"FPS reales: {fps_count}")
                 fps_count = 0
@@ -769,6 +958,7 @@ if __name__ == "__main__":
             debug, warp_vis, text = rx.process_frame(frame)
 
             cv2.imshow("Camara", debug)
+
             if warp_vis is not None:
                 cv2.imshow("Símbolo", warp_vis)
 
@@ -784,9 +974,15 @@ if __name__ == "__main__":
             if text and not final_printed:
                 print("\n\nTexto completo decodificado:")
                 print(text)
+
+                rx._print_final_metrics()
+
                 print()
                 final_printed = True
 
     finally:
         print(f"\n\nTexto final decodificado:\n{rx._decoded_text}")
+
+        rx._print_final_metrics()
+
         rx.close_camera()
