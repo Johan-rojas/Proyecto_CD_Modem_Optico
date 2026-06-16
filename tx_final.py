@@ -1,20 +1,44 @@
+import os
+import sys
+import math
+import matplotlib
+
+matplotlib.rcParams["toolbar"] = "None"
+
 import matplotlib.pyplot as plt
 import numpy as np
 
 
 # ─────────────────────────── CONFIGURACIÓN DE TX ─────────────────────────────
 # Modo principal estable:
-#   "OOK_MANCHESTER" = blanco/negro + Manchester. Es el modo de la demo.
+#   OOK_MANCHESTER
 #
-# Modo opcional preparado:
-#   "ASK4_GRAY" = 4 niveles de gris, 2 bits por celda de payload.
-#   Este modo queda implementado en TX, pero requiere RX compatible.
+# Segunda modulación física:
+#   ASK4_GRAY
+#
+# También puedes seleccionar por consola:
+#   python tx_final.py OOK_MANCHESTER
+#   python tx_final.py ASK4_GRAY
 MODULATION = "OOK_MANCHESTER"
 
 SYMBOL_SIZE = 40
 TX_DELAY = 0.05
 FULLSCREEN = True
 SAVE_FIRST_FRAME_PNG = True
+SAVE_MODULATION_EXAMPLES = True
+RUN_DIGITAL_LOOPBACK_TEST = True
+
+
+# ─────────────────────────── TEXTO DE PRUEBA ─────────────────────────────────
+DEMO_TEXT = (
+    "La vision artificial permite interpretar imagenes mediante algoritmos "
+    "que detectan patrones, formas y relaciones espaciales. Los sistemas "
+    "modernos utilizan transformaciones geometricas, segmentacion y analisis "
+    "de contornos para identificar objetos incluso bajo rotacion o perspectiva. "
+    "Los fiduciales son referencias visuales usadas para calcular orientacion, "
+    "escala y posicion, facilitando la reconstruccion proyectiva y la extraccion "
+    "robusta de informacion contenida dentro de una region determinada."
+)
 
 
 # ─────────────────────────── CRC-16 CCITT-FALSE ──────────────────────────────
@@ -28,6 +52,7 @@ def crc16(bits: list[int]) -> int:
             chunk += [0] * (8 - len(chunk))
 
         byte_val = 0
+
         for b in chunk:
             byte_val = (byte_val << 1) | int(b)
 
@@ -44,6 +69,73 @@ def crc16(bits: list[int]) -> int:
     return crc
 
 
+# ─────────────────────────── UTILIDADES ──────────────────────────────────────
+def bits_to_int(bits: list[int]) -> int:
+    val = 0
+
+    for b in bits:
+        val = (val << 1) | int(b)
+
+    return val
+
+
+def text_to_bits(text: str) -> list[int]:
+    return [int(b) for char in text for b in format(ord(char), "08b")]
+
+
+def bits_to_text(bits: list[int]) -> str:
+    chars = []
+
+    for i in range(0, len(bits) - 7, 8):
+        val = bits_to_int(bits[i:i + 8])
+
+        if val == 0:
+            break
+
+        try:
+            chars.append(chr(val))
+        except ValueError:
+            pass
+
+    return "".join(chars)
+
+
+def compute_ber(expected_bits: list[int], received_bits: list[int]) -> dict:
+    max_len = max(len(expected_bits), len(received_bits))
+
+    if max_len == 0:
+        return {
+            "expected_bits": len(expected_bits),
+            "received_bits": len(received_bits),
+            "compared_bits": 0,
+            "bit_errors": 0,
+            "ber": 0.0,
+        }
+
+    errors = 0
+
+    for i in range(max_len):
+        expected = expected_bits[i] if i < len(expected_bits) else None
+        received = received_bits[i] if i < len(received_bits) else None
+
+        if expected != received:
+            errors += 1
+
+    return {
+        "expected_bits": len(expected_bits),
+        "received_bits": len(received_bits),
+        "compared_bits": max_len,
+        "bit_errors": errors,
+        "ber": errors / max_len,
+    }
+
+
+def get_modulation_from_args(default: str) -> str:
+    if len(sys.argv) >= 2:
+        return sys.argv[1].strip().upper()
+    return default
+
+
 # ─────────────────────────── CLASE TX ────────────────────────────────────────
 class Tx:
     # Cabecera
@@ -53,40 +145,72 @@ class Tx:
     NFRAME_BITS = 16
     NPAYLOAD_BITS = 16
     CHECKSUM_BITS = 16
+
     HEADER_BITS = (
         PREAMBLE_BITS +
         NTOTAL_BITS +
         NFRAME_BITS +
         NPAYLOAD_BITS +
         CHECKSUM_BITS
-    )  # 80 bits/celdas
+    )
 
     # Fiduciales
     FID_SIZE = 7
     QUIET = 1
     BORDER = 2
 
-    # Pilotos explícitos para calibración brillo/umbral en RX.
-    # Deben coincidir exactamente con rx.py.
-    #
-    # Estos pilotos quedan fuera de las esquinas y fuera de los fiduciales.
-    PILOT_BLACK_POSITIONS = [
-        (8, 8), (8, 31),
-        (31, 8), (31, 31),
-        (10, 20), (29, 20),
-        (20, 10), (20, 29),
-    ]
+    VALID_MODULATIONS = {
+        "OOK_MANCHESTER",
+        "ASK4_GRAY",
+    }
 
-    PILOT_WHITE_POSITIONS = [
-        (8, 9), (8, 30),
-        (31, 9), (31, 30),
-        (11, 20), (28, 20),
-        (20, 11), (20, 28),
-    ]
+    # Pilotos de 4 niveles.
+    # Estos mismos deben existir en rx.py.
+    PILOT_LEVEL_POSITIONS = {
+        0: [
+            (8, 8), (31, 31),
+            (10, 20), (20, 10),
+        ],
+        1: [
+            (8, 9), (31, 30),
+            (11, 20), (20, 11),
+        ],
+        2: [
+            (8, 30), (31, 9),
+            (28, 20), (20, 28),
+        ],
+        3: [
+            (8, 31), (31, 8),
+            (29, 20), (20, 29),
+        ],
+    }
 
-    VALID_MODULATIONS = {"OOK_MANCHESTER", "ASK4_GRAY"}
+    # Niveles físicos para 4-ASK.
+    # Cada celda representa 2 bits.
+    ASK4_BITS_TO_LEVEL = {
+        (0, 0): 0.15,
+        (0, 1): 0.40,
+        (1, 0): 0.65,
+        (1, 1): 0.90,
+    }
+
+    ASK4_LEVEL_TO_BITS = {
+        0: (0, 0),
+        1: (0, 1),
+        2: (1, 0),
+        3: (1, 1),
+    }
+
+    ASK4_LEVEL_VALUES = {
+        0: 0.15,
+        1: 0.40,
+        2: 0.65,
+        3: 0.90,
+    }
 
     def __init__(self, symbol_size: int = 40, modulation: str = "OOK_MANCHESTER"):
+        modulation = modulation.upper()
+
         if modulation not in self.VALID_MODULATIONS:
             raise ValueError(
                 f"Modulación no soportada: {modulation}. "
@@ -116,10 +240,8 @@ class Tx:
             )
 
         if self.modulation == "OOK_MANCHESTER":
-            # Cada bit real usa 2 celdas Manchester.
             self._payload_bits_per_frame = self._payload_cells // 2
         elif self.modulation == "ASK4_GRAY":
-            # Cada celda de payload lleva 2 bits.
             self._payload_bits_per_frame = self._payload_cells * 2
         else:
             raise RuntimeError("Modulación no reconocida.")
@@ -127,31 +249,31 @@ class Tx:
         self._texto: str | None = None
         self._binary: list[int] | None = None
         self.vec_imgs: list[np.ndarray] | None = None
+        self._frame_cells_list: list[list[float]] | None = None
         self._stop = False
 
-    # ─────────────────────────── ESTRUCTURA ESPACIAL ─────────────────────────
+    # ─────────────────────────── ESPACIAL ─────────────────────────────────────
     def _patron_fiducial(self) -> np.ndarray:
-        """
-        Patrón tipo finder QR simplificado:
-        negro externo, blanco medio, negro interno sobre fondo blanco.
-        """
         f = np.zeros((self.FID_SIZE, self.FID_SIZE), dtype=float)
         f[1:6, 1:6] = 1.0
         f[2:5, 2:5] = 0.0
         return f
 
+    def _all_pilot_positions(self) -> list[tuple[int, int]]:
+        positions = []
+
+        for pts in self.PILOT_LEVEL_POSITIONS.values():
+            positions.extend(pts)
+
+        return positions
+
     def _build_reserved_mask(self) -> np.ndarray:
-        """
-        Reserva:
-          - fiduciales + quiet zones en las esquinas.
-          - pilotos explícitos blanco/negro.
-        """
         N = self.symbol_size
         FQ = self.FID_SIZE + self.QUIET
 
         mask = np.zeros((N, N), dtype=bool)
 
-        # Reservar fiduciales + quiet zones
+        # Fiduciales + quiet zones
         for r0, c0 in [
             (0, 0),
             (0, N - FQ),
@@ -160,8 +282,8 @@ class Tx:
         ]:
             mask[r0:r0 + FQ, c0:c0 + FQ] = True
 
-        # Reservar pilotos
-        for r, c in self.PILOT_BLACK_POSITIONS + self.PILOT_WHITE_POSITIONS:
+        # Pilotos explícitos
+        for r, c in self._all_pilot_positions():
             if not (0 <= r < N and 0 <= c < N):
                 raise ValueError(f"Piloto fuera de la grilla: {(r, c)}")
             mask[r, c] = True
@@ -187,29 +309,30 @@ class Tx:
             (N - FQ, 0, self.QUIET, 0),
             (N - FQ, N - FQ, self.QUIET, self.QUIET),
         ]:
-            # Zona quiet blanca
             symbol[r0:r0 + FQ, c0:c0 + FQ] = 1.0
 
-            # Fiducial
             symbol[
                 r0 + dr:r0 + dr + self.FID_SIZE,
                 c0 + dc:c0 + dc + self.FID_SIZE
             ] = fid
 
+    def _pilot_value_for_level(self, level: int) -> float:
+        if self.modulation == "OOK_MANCHESTER":
+            # En OOK dejamos pilotos de dos niveles físicos:
+            # niveles 0 y 1 como negro; niveles 2 y 3 como blanco.
+            return 0.0 if level in (0, 1) else 1.0
+
+        if self.modulation == "ASK4_GRAY":
+            return self.ASK4_LEVEL_VALUES[level]
+
+        raise RuntimeError("Modulación no reconocida.")
+
     def _draw_pilots(self, symbol: np.ndarray) -> None:
-        """
-        Pilotos explícitos:
-          negros = 0.0
-          blancos = 1.0
+        for level, positions in self.PILOT_LEVEL_POSITIONS.items():
+            value = self._pilot_value_for_level(level)
 
-        En RX se usarán para estimar umbral adaptativo:
-          threshold = (media_negros + media_blancos) / 2
-        """
-        for r, c in self.PILOT_BLACK_POSITIONS:
-            symbol[r, c] = 0.0
-
-        for r, c in self.PILOT_WHITE_POSITIONS:
-            symbol[r, c] = 1.0
+            for r, c in positions:
+                symbol[r, c] = value
 
     # ─────────────────────────── UTILIDADES BINARIAS ─────────────────────────
     @staticmethod
@@ -229,32 +352,55 @@ class Tx:
         return enc
 
     @staticmethod
-    def _ask4_encode(bits: list[int]) -> list[float]:
-        """
-        4-ASK en escala de grises:
-          00 -> 0.15
-          01 -> 0.40
-          10 -> 0.65
-          11 -> 0.90
+    def _manchester_decode(bits: list[int]) -> list[int] | None:
+        if len(bits) % 2 != 0:
+            return None
 
-        Este modo queda implementado para cumplir segunda modulación.
-        Requiere RX compatible para demodular 4 niveles.
-        """
-        levels = {
-            (0, 0): 0.15,
-            (0, 1): 0.40,
-            (1, 0): 0.65,
-            (1, 1): 0.90,
-        }
+        dec = []
 
+        for i in range(0, len(bits), 2):
+            a = bits[i]
+            b = bits[i + 1]
+
+            if a == 1 and b == 0:
+                dec.append(1)
+            elif a == 0 and b == 1:
+                dec.append(0)
+            else:
+                return None
+
+        return dec
+
+    @classmethod
+    def _ask4_encode(cls, bits: list[int]) -> list[float]:
         cells = []
 
         for i in range(0, len(bits), 2):
             b0 = bits[i]
             b1 = bits[i + 1] if i + 1 < len(bits) else 0
-            cells.append(levels[(b0, b1)])
+            cells.append(cls.ASK4_BITS_TO_LEVEL[(b0, b1)])
 
         return cells
+
+    @classmethod
+    def _ask4_decode_ideal(cls, cells: list[float], n_bits: int) -> list[int]:
+        levels = [
+            (0.15, (0, 0)),
+            (0.40, (0, 1)),
+            (0.65, (1, 0)),
+            (0.90, (1, 1)),
+        ]
+
+        decoded = []
+
+        for value in cells:
+            _, bits_pair = min(levels, key=lambda item: abs(float(value) - item[0]))
+            decoded.extend(list(bits_pair))
+
+            if len(decoded) >= n_bits:
+                break
+
+        return decoded[:n_bits]
 
     @staticmethod
     def _validate_text(texto: str) -> None:
@@ -272,11 +418,7 @@ class Tx:
         self._validate_text(texto)
 
         self._texto = texto
-        self._binary = [
-            int(b)
-            for char in texto
-            for b in format(ord(char), "08b")
-        ]
+        self._binary = text_to_bits(texto)
 
         self._gen_img()
 
@@ -313,9 +455,11 @@ class Tx:
             if self.modulation == "OOK_MANCHESTER":
                 payload_cells = self._manchester_encode(real_bits)
                 pad_value = 1.0
+
             elif self.modulation == "ASK4_GRAY":
                 payload_cells = self._ask4_encode(real_bits)
                 pad_value = 1.0
+
             else:
                 raise RuntimeError("Modulación no reconocida.")
 
@@ -347,21 +491,19 @@ class Tx:
         B = self.BORDER
 
         frames = self._build_frames()
+        self._frame_cells_list = frames
+
         imgs = []
 
         for frame_cells in frames:
-            # Fondo blanco dentro del símbolo.
             symbol = np.ones((N, N), dtype=float)
 
-            # Datos y cabecera
             for (r, c), value in zip(self._data_positions, frame_cells):
                 symbol[r, c] = float(value)
 
-            # Fiduciales y pilotos se dibujan después para garantizar reserva.
             self._draw_fiducials(symbol)
             self._draw_pilots(symbol)
 
-            # Borde blanco externo para separación visual del fondo oscuro.
             bordered = np.ones((N + 2 * B, N + 2 * B), dtype=float)
             bordered[B:B + N, B:B + N] = symbol
 
@@ -369,13 +511,129 @@ class Tx:
 
         self.vec_imgs = imgs
 
-    # ─────────────────────────── DRAW EN TIEMPO REAL ─────────────────────────
-    def draw(self, delay: float = 0.05, fullscreen: bool = True) -> None:
-        """
-        Muestra los símbolos en bucle continuo hasta que el usuario presione 'q'.
+    # ─────────────────────────── LOOPBACK DIGITAL ─────────────────────────────
+    def digital_loopback_decode(self) -> dict:
+        if self._frame_cells_list is None:
+            raise RuntimeError("No hay tramas generadas. Llama a encode().")
 
-        Ventana con fondo oscuro y sin ejes para reducir interferencias visuales.
-        """
+        frame_store: dict[int, list[int]] = {}
+        expected_total = None
+        crc_ok_count = 0
+        crc_fail_count = 0
+        invalid_count = 0
+
+        for frame_cells in self._frame_cells_list:
+            raw_bits = [1 if x >= 0.5 else 0 for x in frame_cells[:self.HEADER_BITS]]
+
+            ptr = 0
+
+            preamble = bits_to_int(raw_bits[ptr:ptr + self.PREAMBLE_BITS])
+            ptr += self.PREAMBLE_BITS
+
+            n_total = bits_to_int(raw_bits[ptr:ptr + self.NTOTAL_BITS])
+            ptr += self.NTOTAL_BITS
+
+            n_frame = bits_to_int(raw_bits[ptr:ptr + self.NFRAME_BITS])
+            ptr += self.NFRAME_BITS
+
+            n_payload = bits_to_int(raw_bits[ptr:ptr + self.NPAYLOAD_BITS])
+            ptr += self.NPAYLOAD_BITS
+
+            crc_rx = bits_to_int(raw_bits[ptr:ptr + self.CHECKSUM_BITS])
+            ptr += self.CHECKSUM_BITS
+
+            if preamble != self.PREAMBLE:
+                invalid_count += 1
+                continue
+
+            if n_total <= 0 or n_frame < 0 or n_frame >= n_total:
+                invalid_count += 1
+                continue
+
+            payload_start = self.HEADER_BITS
+
+            if self.modulation == "OOK_MANCHESTER":
+                payload_cells_count = n_payload * 2
+                payload_cells = frame_cells[payload_start:payload_start + payload_cells_count]
+                payload_cell_bits = [1 if x >= 0.5 else 0 for x in payload_cells]
+                payload_bits = self._manchester_decode(payload_cell_bits)
+
+                if payload_bits is None:
+                    crc_fail_count += 1
+                    continue
+
+            elif self.modulation == "ASK4_GRAY":
+                payload_cells_count = math.ceil(n_payload / 2)
+                payload_cells = frame_cells[payload_start:payload_start + payload_cells_count]
+                payload_bits = self._ask4_decode_ideal(payload_cells, n_payload)
+
+            else:
+                invalid_count += 1
+                continue
+
+            crc_calc = crc16(payload_bits)
+
+            if crc_calc != crc_rx:
+                crc_fail_count += 1
+                continue
+
+            crc_ok_count += 1
+            expected_total = n_total
+            frame_store[n_frame] = payload_bits
+
+        reconstructed_bits = []
+
+        if expected_total is not None and len(frame_store) == expected_total:
+            for i in range(expected_total):
+                reconstructed_bits.extend(frame_store[i])
+
+        reconstructed_text = bits_to_text(reconstructed_bits)
+        expected_bits = text_to_bits(self._texto or "")
+
+        ber_metrics = compute_ber(
+            expected_bits,
+            reconstructed_bits[:len(expected_bits)]
+        )
+
+        return {
+            "modulation": self.modulation,
+            "expected_frames": expected_total,
+            "decoded_frames": len(frame_store),
+            "crc_ok": crc_ok_count,
+            "crc_fail": crc_fail_count,
+            "invalid": invalid_count,
+            "expected_chars": len(self._texto or ""),
+            "received_chars": len(reconstructed_text),
+            "text_match": reconstructed_text == (self._texto or ""),
+            "ber": ber_metrics["ber"],
+            "bit_errors": ber_metrics["bit_errors"],
+            "expected_bits": ber_metrics["expected_bits"],
+            "received_bits": ber_metrics["received_bits"],
+            "compared_bits": ber_metrics["compared_bits"],
+        }
+
+    def print_loopback_report(self) -> None:
+        result = self.digital_loopback_decode()
+
+        print("Prueba digital interna")
+        print("──────────────────────")
+        print(f"Modulación:             {result['modulation']}")
+        print(f"Frames esperados:       {result['expected_frames']}")
+        print(f"Frames decodificados:   {result['decoded_frames']}")
+        print(f"CRC OK:                 {result['crc_ok']}")
+        print(f"CRC fallidos:           {result['crc_fail']}")
+        print(f"Frames inválidos:       {result['invalid']}")
+        print(f"Caracteres esperados:   {result['expected_chars']}")
+        print(f"Caracteres recibidos:   {result['received_chars']}")
+        print(f"Bits esperados:         {result['expected_bits']}")
+        print(f"Bits comparados:        {result['compared_bits']}")
+        print(f"Errores de bit:         {result['bit_errors']}")
+        print(f"BER:                    {result['ber']:.2e}")
+        print(f"Texto exacto:           {'SI' if result['text_match'] else 'NO'}")
+        print("")
+
+    # ─────────────────────────── DRAW ─────────────────────────────────────────
+    def draw(self, delay: float = 0.05, fullscreen: bool = True) -> None:
         if self.vec_imgs is None:
             raise RuntimeError("Llama a encode() antes de draw().")
 
@@ -389,9 +647,22 @@ class Tx:
         ax.axis("off")
 
         try:
+            fig.canvas.manager.set_window_title("TX Modem Optico")
+        except Exception:
+            pass
+
+        try:
             manager = plt.get_current_fig_manager()
+
+            if hasattr(manager, "toolbar") and manager.toolbar is not None:
+                try:
+                    manager.toolbar.hide()
+                except Exception:
+                    pass
+
             if fullscreen:
                 manager.full_screen_toggle()
+
         except Exception:
             pass
 
@@ -403,10 +674,10 @@ class Tx:
         fig.canvas.mpl_connect("key_press_event", on_key)
 
         n = len(self.vec_imgs)
-        cycle = 0
 
         print("\nTX en ejecución.")
         print("Presiona 'q' sobre la ventana del TX para detener.")
+        print(f"Modulación activa: {self.modulation}")
         print(f"Delay por trama: {delay:.3f} s")
         print(f"Tramas por ciclo: {n}")
         print(f"Tiempo ideal de ciclo TX: {n * delay:.3f} s\n")
@@ -414,7 +685,7 @@ class Tx:
         image_artist = None
 
         while not self._stop:
-            for i, img in enumerate(self.vec_imgs):
+            for img in self.vec_imgs:
                 if self._stop:
                     break
 
@@ -433,15 +704,12 @@ class Tx:
                 fig.canvas.draw_idle()
                 plt.pause(delay)
 
-            if not self._stop:
-                cycle += 1
-
         try:
             plt.close(fig)
         except Exception:
             pass
 
-    # ─────────────────────────── EXPORTACIÓN DEBUG ───────────────────────────
+    # ─────────────────────────── EXPORTACIÓN ──────────────────────────────────
     def save_first_frame(self, filename: str = "tx_first_frame.png") -> None:
         if self.vec_imgs is None or len(self.vec_imgs) == 0:
             raise RuntimeError("No hay frames generados.")
@@ -464,8 +732,7 @@ class Tx:
         print(f"Borde externo: {self.BORDER} celdas")
         print(f"Fiduciales: 4 patrones de {self.FID_SIZE}×{self.FID_SIZE}")
         print(f"Quiet zone por fiducial: {self.QUIET}")
-        print(f"Pilotos negros: {len(self.PILOT_BLACK_POSITIONS)}")
-        print(f"Pilotos blancos: {len(self.PILOT_WHITE_POSITIONS)}")
+        print(f"Pilotos por nivel: 4 niveles × 4 pilotos = 16 pilotos")
         print(f"Celdas reservadas totales: {int(self._reserved_mask.sum())}")
         print(f"Celdas de datos disponibles: {nd}")
         print(f"Cabecera: {hc} celdas")
@@ -477,6 +744,7 @@ class Tx:
         if self.modulation == "OOK_MANCHESTER":
             print(f"Payload Manchester: {pc} celdas → {pb} bits útiles/frame")
             print(f"Aprox. chars útiles/frame: {pb // 8}")
+
         elif self.modulation == "ASK4_GRAY":
             print(f"Payload 4-ASK: {pc} celdas → {pb} bits útiles/frame")
             print(f"Aprox. chars útiles/frame: {pb // 8}")
@@ -491,21 +759,46 @@ class Tx:
         print("")
 
 
-# ─────────────────────────────── DEMO ────────────────────────────────────────
-if __name__ == "__main__":
-    texto = (
-        "La vision artificial permite interpretar imagenes mediante algoritmos "
-        "que detectan patrones, formas y relaciones espaciales. Los sistemas "
-        "modernos utilizan transformaciones geometricas, segmentacion y analisis "
-        "de contornos para identificar objetos incluso bajo rotacion o perspectiva. "
-        "Los fiduciales son referencias visuales usadas para calcular orientacion, "
-        "escala y posicion, facilitando la reconstruccion proyectiva y la extraccion "
-        "robusta de informacion contenida dentro de una region determinada."
-    )
+# ─────────────────────────── DEMOSTRACIONES ──────────────────────────────────
+def save_modulation_examples(texto: str) -> None:
+    os.makedirs("debug_tx", exist_ok=True)
 
-    tx = Tx(symbol_size=SYMBOL_SIZE, modulation=MODULATION)
-    tx.encode(texto)
+    tx_ook = Tx(symbol_size=SYMBOL_SIZE, modulation="OOK_MANCHESTER")
+    tx_ook.encode(texto)
+    tx_ook.save_first_frame(os.path.join("debug_tx", "frame_OOK_MANCHESTER.png"))
+
+    tx_ask4 = Tx(symbol_size=SYMBOL_SIZE, modulation="ASK4_GRAY")
+    tx_ask4.encode(texto)
+    tx_ask4.save_first_frame(os.path.join("debug_tx", "frame_ASK4_GRAY.png"))
+
+    print("Ejemplos de modulación guardados en debug_tx:")
+    print("  - frame_OOK_MANCHESTER.png")
+    print("  - frame_ASK4_GRAY.png")
+    print("")
+
+
+# ─────────────────────────────── MAIN ────────────────────────────────────────
+if __name__ == "__main__":
+    modulation = get_modulation_from_args(MODULATION)
+
+    if SAVE_MODULATION_EXAMPLES:
+        save_modulation_examples(DEMO_TEXT)
+
+    if RUN_DIGITAL_LOOPBACK_TEST:
+        print("Prueba interna OOK_MANCHESTER")
+        tx_test_ook = Tx(symbol_size=SYMBOL_SIZE, modulation="OOK_MANCHESTER")
+        tx_test_ook.encode(DEMO_TEXT)
+        tx_test_ook.print_loopback_report()
+
+        print("Prueba interna ASK4_GRAY")
+        tx_test_ask = Tx(symbol_size=SYMBOL_SIZE, modulation="ASK4_GRAY")
+        tx_test_ask.encode(DEMO_TEXT)
+        tx_test_ask.print_loopback_report()
+
+    tx = Tx(symbol_size=SYMBOL_SIZE, modulation=modulation)
+    tx.encode(DEMO_TEXT)
     tx.info()
+    tx.print_loopback_report()
 
     if SAVE_FIRST_FRAME_PNG:
         tx.save_first_frame("tx_first_frame.png")

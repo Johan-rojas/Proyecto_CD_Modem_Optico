@@ -1,5 +1,7 @@
 import os
+import sys
 import time
+import math
 from typing import Optional
 
 import cv2
@@ -7,35 +9,36 @@ import numpy as np
 
 
 # ─────────────────────────── CONFIGURACIÓN GENERAL ───────────────────────────
-# Debe coincidir con el transmisor tx_final.py
+# RX_MODULATION:
+#   "AUTO"            = intenta OOK_MANCHESTER y ASK4_GRAY automáticamente.
+#   "OOK_MANCHESTER" = fuerza OOK + Manchester.
+#   "ASK4_GRAY"      = fuerza 4-ASK en escala de grises.
+#
+# También puedes seleccionar por consola:
+#   python rx.py AUTO
+#   python rx.py OOK_MANCHESTER
+#   python rx.py ASK4_GRAY
+RX_MODULATION = "AUTO"
+
 SYMBOL_SIZE = 40
 FID_SIZE = 7
 QUIET_INNER = 1
 BORDER = 2
 FQ = FID_SIZE + QUIET_INNER
 
-# Cámara RX
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 
-# Imagen rectificada para lectura de grilla.
-# 800 / 40 = 20 px por celda aprox.
 WARP_SIZE = 800
-
-# Escala de procesamiento.
 PROCESS_SCALE = 0.5
-
-# Estabilidad temporal.
 REQUIRED_STABLE = 1
 
-# Debug / consola
 DEBUG_VERBOSE = False
 PRINT_INVALID_FRAMES = False
 PRINT_CRC_ERRORS = True
 SAVE_DEBUG_IMAGE = True
 
-# BER contra texto esperado
 ENABLE_BER_EVALUATION = True
 
 EXPECTED_TEXT = (
@@ -48,46 +51,83 @@ EXPECTED_TEXT = (
     "robusta de informacion contenida dentro de una region determinada."
 )
 
-# Pilotos explícitos: deben coincidir exactamente con tx_final.py
-PILOT_BLACK_POSITIONS = [
-    (8, 8), (8, 31),
-    (31, 8), (31, 31),
-    (10, 20), (29, 20),
-    (20, 10), (20, 29),
-]
+VALID_RX_MODULATIONS = {
+    "AUTO",
+    "OOK_MANCHESTER",
+    "ASK4_GRAY",
+}
 
-PILOT_WHITE_POSITIONS = [
-    (8, 9), (8, 30),
-    (31, 9), (31, 30),
-    (11, 20), (28, 20),
-    (20, 11), (20, 28),
-]
+# Pilotos de 4 niveles. Deben coincidir con tx_final.py.
+PILOT_LEVEL_POSITIONS = {
+    0: [
+        (8, 8), (31, 31),
+        (10, 20), (20, 10),
+    ],
+    1: [
+        (8, 9), (31, 30),
+        (11, 20), (20, 11),
+    ],
+    2: [
+        (8, 30), (31, 9),
+        (28, 20), (20, 28),
+    ],
+    3: [
+        (8, 31), (31, 8),
+        (29, 20), (20, 29),
+    ],
+}
 
 USE_PILOT_THRESHOLD = True
-MIN_PILOT_CONTRAST = 20.0
+MIN_BINARY_PILOT_CONTRAST = 20.0
 
-# Cabecera, igual que Tx
+# Cabecera común
 PREAMBLE = 0xDEAD
 PREAMBLE_BITS = 16
 NTOTAL_BITS = 16
 NFRAME_BITS = 16
 NPAYLOAD_BITS = 16
 CHECKSUM_BITS = 16
-HEADER_BITS = PREAMBLE_BITS + NTOTAL_BITS + NFRAME_BITS + NPAYLOAD_BITS + CHECKSUM_BITS
 
-# Validaciones de protocolo
+HEADER_BITS = (
+    PREAMBLE_BITS +
+    NTOTAL_BITS +
+    NFRAME_BITS +
+    NPAYLOAD_BITS +
+    CHECKSUM_BITS
+)
+
 MAX_TOTAL_FRAMES = 100
 
 
+def get_rx_modulation_from_args(default: str) -> str:
+    if len(sys.argv) >= 2:
+        mode = sys.argv[1].strip().upper()
+    else:
+        mode = default
+
+    if mode not in VALID_RX_MODULATIONS:
+        raise ValueError(
+            f"Modo RX inválido: {mode}. "
+            f"Opciones válidas: {sorted(VALID_RX_MODULATIONS)}"
+        )
+
+    return mode
+
+
 # ─────────────────────────── MÁSCARAS ESPACIALES ─────────────────────────────
+def all_pilot_positions() -> list[tuple[int, int]]:
+    positions = []
+
+    for pts in PILOT_LEVEL_POSITIONS.values():
+        positions.extend(pts)
+
+    return positions
+
+
 def build_reserved_mask(N=SYMBOL_SIZE, FQ=FQ):
-    """
-    Reserva:
-      - fiduciales + quiet zone
-      - pilotos explícitos negro/blanco
-    """
     mask = np.zeros((N, N), dtype=bool)
 
+    # Fiduciales + quiet zones
     for r0, c0 in [
         (0, 0),
         (0, N - FQ),
@@ -96,7 +136,8 @@ def build_reserved_mask(N=SYMBOL_SIZE, FQ=FQ):
     ]:
         mask[r0:r0 + FQ, c0:c0 + FQ] = True
 
-    for r, c in PILOT_BLACK_POSITIONS + PILOT_WHITE_POSITIONS:
+    # Pilotos
+    for r, c in all_pilot_positions():
         if not (0 <= r < N and 0 <= c < N):
             raise ValueError(f"Piloto fuera de la grilla: {(r, c)}")
         mask[r, c] = True
@@ -114,7 +155,14 @@ DATA_POSITIONS = [
 ]
 
 DATA_CELLS = len(DATA_POSITIONS)
-MAX_PAYLOAD_BITS_PER_FRAME = (DATA_CELLS - HEADER_BITS) // 2
+PAYLOAD_CELLS = DATA_CELLS - HEADER_BITS
+
+OOK_MAX_PAYLOAD_BITS_PER_FRAME = PAYLOAD_CELLS // 2
+ASK4_MAX_PAYLOAD_BITS_PER_FRAME = PAYLOAD_CELLS * 2
+BROAD_MAX_PAYLOAD_BITS_PER_FRAME = max(
+    OOK_MAX_PAYLOAD_BITS_PER_FRAME,
+    ASK4_MAX_PAYLOAD_BITS_PER_FRAME,
+)
 
 
 # ─────────────────────────── CRC-16 CCITT-FALSE ──────────────────────────────
@@ -128,6 +176,7 @@ def crc16(bits: list) -> int:
             chunk += [0] * (8 - len(chunk))
 
         byte_val = 0
+
         for b in chunk:
             byte_val = (byte_val << 1) | int(b)
 
@@ -147,40 +196,15 @@ def crc16(bits: list) -> int:
 # ─────────────────────────── DECODIFICACIÓN Y MÉTRICAS ───────────────────────
 def bits_to_int(bits: list) -> int:
     val = 0
+
     for b in bits:
         val = (val << 1) | int(b)
+
     return val
 
 
 def text_to_bits(text: str) -> list[int]:
     return [int(b) for char in text for b in format(ord(char), "08b")]
-
-
-def manchester_decode(bits: list) -> Optional[list]:
-    """
-    Manchester usado por Tx:
-      1 -> 10
-      0 -> 01
-
-    Si aparece 00 o 11, la trama se considera corrupta.
-    """
-    decoded = []
-
-    if len(bits) % 2 != 0:
-        return None
-
-    for i in range(0, len(bits), 2):
-        a = bits[i]
-        b = bits[i + 1]
-
-        if a == 1 and b == 0:
-            decoded.append(1)
-        elif a == 0 and b == 1:
-            decoded.append(0)
-        else:
-            return None
-
-    return decoded
 
 
 def bits_to_text(bits: list) -> str:
@@ -221,47 +245,54 @@ def compute_ber(expected_bits: list[int], received_bits: list[int]) -> dict:
         if expected != received:
             bit_errors += 1
 
-    ber = bit_errors / max_len
-
     return {
         "expected_bits": len(expected_bits),
         "received_bits": len(received_bits),
         "compared_bits": max_len,
         "bit_errors": bit_errors,
-        "ber": ber,
+        "ber": bit_errors / max_len,
     }
 
 
-def parse_frame(all_bits: list):
-    """
-    Separa una trama en:
-      PREAMBLE
-      N_TOTAL
-      N_FRAME
-      N_PAYLOAD
-      CRC
-      PAYLOAD Manchester
+def manchester_decode(bits: list) -> Optional[list]:
+    decoded = []
 
-    Devuelve None si la trama no es válida.
-    """
-    if len(all_bits) < HEADER_BITS:
+    if len(bits) % 2 != 0:
+        return None
+
+    for i in range(0, len(bits), 2):
+        a = bits[i]
+        b = bits[i + 1]
+
+        if a == 1 and b == 0:
+            decoded.append(1)
+        elif a == 0 and b == 1:
+            decoded.append(0)
+        else:
+            return None
+
+    return decoded
+
+
+def parse_common_header(binary_bits: list[int]):
+    if len(binary_bits) < HEADER_BITS:
         return None
 
     ptr = 0
 
-    preamble = bits_to_int(all_bits[ptr:ptr + PREAMBLE_BITS])
+    preamble = bits_to_int(binary_bits[ptr:ptr + PREAMBLE_BITS])
     ptr += PREAMBLE_BITS
 
-    n_total = bits_to_int(all_bits[ptr:ptr + NTOTAL_BITS])
+    n_total = bits_to_int(binary_bits[ptr:ptr + NTOTAL_BITS])
     ptr += NTOTAL_BITS
 
-    n_frame = bits_to_int(all_bits[ptr:ptr + NFRAME_BITS])
+    n_frame = bits_to_int(binary_bits[ptr:ptr + NFRAME_BITS])
     ptr += NFRAME_BITS
 
-    n_payload = bits_to_int(all_bits[ptr:ptr + NPAYLOAD_BITS])
+    n_payload = bits_to_int(binary_bits[ptr:ptr + NPAYLOAD_BITS])
     ptr += NPAYLOAD_BITS
 
-    crc_rx = bits_to_int(all_bits[ptr:ptr + CHECKSUM_BITS])
+    crc_rx = bits_to_int(binary_bits[ptr:ptr + CHECKSUM_BITS])
     ptr += CHECKSUM_BITS
 
     if preamble != PREAMBLE:
@@ -273,15 +304,57 @@ def parse_frame(all_bits: list):
     if n_frame < 0 or n_frame >= n_total:
         return None
 
-    if n_payload <= 0 or n_payload > MAX_PAYLOAD_BITS_PER_FRAME:
+    if n_payload <= 0 or n_payload > BROAD_MAX_PAYLOAD_BITS_PER_FRAME:
+        return None
+
+    return {
+        "n_total": n_total,
+        "n_frame": n_frame,
+        "n_payload": n_payload,
+        "crc_rx": crc_rx,
+    }
+
+
+def ask4_decode_from_means(payload_means: list[float], n_bits: int, calibration: dict) -> list[int]:
+    level_means = calibration["level_means"]
+
+    decoded = []
+
+    level_to_bits = {
+        0: (0, 0),
+        1: (0, 1),
+        2: (1, 0),
+        3: (1, 1),
+    }
+
+    for value in payload_means:
+        nearest_level = min(
+            [0, 1, 2, 3],
+            key=lambda level: abs(float(value) - level_means[level])
+        )
+
+        decoded.extend(list(level_to_bits[nearest_level]))
+
+        if len(decoded) >= n_bits:
+            break
+
+    return decoded[:n_bits]
+
+
+def try_decode_payload_ook(binary_bits: list[int], header: dict):
+    n_payload = header["n_payload"]
+
+    if n_payload > OOK_MAX_PAYLOAD_BITS_PER_FRAME:
         return None
 
     needed_cells = n_payload * 2
+    start = HEADER_BITS
+    end = start + needed_cells
 
-    if ptr + needed_cells > len(all_bits):
+    if end > len(binary_bits):
         return None
 
-    payload_manchester_cells = all_bits[ptr:ptr + needed_cells]
+    payload_manchester_cells = binary_bits[start:end]
     payload_bits = manchester_decode(payload_manchester_cells)
 
     if payload_bits is None:
@@ -291,17 +364,78 @@ def parse_frame(all_bits: list):
         return None
 
     crc_calc = crc16(payload_bits)
-    crc_ok = crc_calc == crc_rx
+    crc_ok = crc_calc == header["crc_rx"]
 
     return {
-        "n_total": n_total,
-        "n_frame": n_frame,
-        "n_payload": n_payload,
+        **header,
+        "modulation": "OOK_MANCHESTER",
         "crc_ok": crc_ok,
         "payload": payload_bits,
-        "crc_rx": crc_rx,
         "crc_calc": crc_calc,
     }
+
+
+def try_decode_payload_ask4(cell_means: list[float], header: dict, calibration: dict):
+    n_payload = header["n_payload"]
+
+    if n_payload > ASK4_MAX_PAYLOAD_BITS_PER_FRAME:
+        return None
+
+    needed_cells = math.ceil(n_payload / 2)
+    start = HEADER_BITS
+    end = start + needed_cells
+
+    if end > len(cell_means):
+        return None
+
+    payload_means = cell_means[start:end]
+    payload_bits = ask4_decode_from_means(payload_means, n_payload, calibration)
+
+    if len(payload_bits) != n_payload:
+        return None
+
+    crc_calc = crc16(payload_bits)
+    crc_ok = crc_calc == header["crc_rx"]
+
+    return {
+        **header,
+        "modulation": "ASK4_GRAY",
+        "crc_ok": crc_ok,
+        "payload": payload_bits,
+        "crc_calc": crc_calc,
+    }
+
+
+def parse_and_decode_frame(cell_means: list[float], binary_bits: list[int], calibration: dict, rx_mode: str):
+    header = parse_common_header(binary_bits)
+
+    if header is None:
+        return None
+
+    candidates = []
+
+    if rx_mode in ("AUTO", "OOK_MANCHESTER"):
+        decoded_ook = try_decode_payload_ook(binary_bits, header)
+
+        if decoded_ook is not None:
+            candidates.append(decoded_ook)
+
+    if rx_mode in ("AUTO", "ASK4_GRAY"):
+        decoded_ask4 = try_decode_payload_ask4(cell_means, header, calibration)
+
+        if decoded_ask4 is not None:
+            candidates.append(decoded_ask4)
+
+    if not candidates:
+        return None
+
+    # En AUTO se acepta el que pase CRC.
+    for c in candidates:
+        if c["crc_ok"]:
+            return c
+
+    # Si ninguno pasa CRC, devolver el primero para reportar error.
+    return candidates[0]
 
 
 # ─────────────────────────── LECTURA DE GRILLA CON PILOTOS ───────────────────
@@ -331,27 +465,23 @@ def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> 
     return float(patch.mean())
 
 
-def estimate_threshold_with_pilots(warp_gray, cell_px: float, border: int = 0):
-    """
-    Calcula umbral con pilotos explícitos.
-    Fallback: Otsu si los pilotos no tienen suficiente contraste.
-    """
-    black_means = [
-        cell_mean(warp_gray, r, c, cell_px, border)
-        for r, c in PILOT_BLACK_POSITIONS
-    ]
+def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0):
+    level_means = {}
 
-    white_means = [
-        cell_mean(warp_gray, r, c, cell_px, border)
-        for r, c in PILOT_WHITE_POSITIONS
-    ]
+    for level, positions in PILOT_LEVEL_POSITIONS.items():
+        values = [
+            cell_mean(warp_gray, r, c, cell_px, border)
+            for r, c in positions
+        ]
+        level_means[level] = float(np.mean(values)) if values else 0.0
 
-    black_mean = float(np.mean(black_means)) if black_means else 0.0
-    white_mean = float(np.mean(white_means)) if white_means else 255.0
-    contrast = white_mean - black_mean
+    binary_black = (level_means[0] + level_means[1]) / 2.0
+    binary_white = (level_means[2] + level_means[3]) / 2.0
 
-    if USE_PILOT_THRESHOLD and contrast >= MIN_PILOT_CONTRAST:
-        threshold = (black_mean + white_mean) / 2.0
+    binary_contrast = binary_white - binary_black
+
+    if USE_PILOT_THRESHOLD and binary_contrast >= MIN_BINARY_PILOT_CONTRAST:
+        binary_threshold = (binary_black + binary_white) / 2.0
         mode = "PILOT"
     else:
         otsu_threshold, _ = cv2.threshold(
@@ -360,98 +490,89 @@ def estimate_threshold_with_pilots(warp_gray, cell_px: float, border: int = 0):
             255,
             cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
-        threshold = float(otsu_threshold)
+        binary_threshold = float(otsu_threshold)
         mode = "OTSU_FALLBACK"
 
+    # Umbrales descriptivos para 4-ASK.
+    ask4_thresholds = {
+        "T01": (level_means[0] + level_means[1]) / 2.0,
+        "T12": (level_means[1] + level_means[2]) / 2.0,
+        "T23": (level_means[2] + level_means[3]) / 2.0,
+    }
+
     return {
-        "threshold": threshold,
         "mode": mode,
-        "black_mean": black_mean,
-        "white_mean": white_mean,
-        "contrast": contrast,
+        "binary_threshold": binary_threshold,
+        "binary_black": binary_black,
+        "binary_white": binary_white,
+        "binary_contrast": binary_contrast,
+        "level_means": level_means,
+        "ask4_thresholds": ask4_thresholds,
     }
 
 
-def read_symbol_bits(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
-    """
-    Lee la grilla rectificada y devuelve:
-      bits de DATA_POSITIONS
-      información de calibración
-
-    Ahora usa pilotos explícitos para estimar el umbral blanco/negro.
-    """
+def read_symbol_cells(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
     global _debug_saved
 
     H, W = warp_gray.shape
-    total_cells = symbol_size
-    cell_px = H / total_cells
+    cell_px = H / symbol_size
 
-    calibration = estimate_threshold_with_pilots(warp_gray, cell_px, border)
-    threshold = calibration["threshold"]
+    calibration = estimate_calibration_with_pilots(warp_gray, cell_px, border)
+    threshold = calibration["binary_threshold"]
 
-    bw = np.where(warp_gray >= threshold, 255, 0).astype(np.uint8)
+    cell_means = []
+    binary_bits = []
+
+    for row, col in DATA_POSITIONS:
+        mean_val = cell_mean(warp_gray, row, col, cell_px, border)
+
+        cell_means.append(mean_val)
+        binary_bits.append(1 if mean_val >= threshold else 0)
 
     if SAVE_DEBUG_IMAGE and not _debug_saved:
         os.makedirs("debug_rx", exist_ok=True)
 
+        bw = np.where(warp_gray >= threshold, 255, 0).astype(np.uint8)
         debug_color = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
 
-        # Primera celda de datos
+        # Primera celda de datos en azul
         first_row, first_col = DATA_POSITIONS[0]
-        for row, col, color in [
-            (first_row, first_col, (255, 0, 0)),
-        ]:
-            r0 = int((row + border) * cell_px)
-            r1 = int((row + border + 1) * cell_px)
-            c0 = int((col + border) * cell_px)
-            c1 = int((col + border + 1) * cell_px)
-            cv2.rectangle(debug_color, (c0, r0), (c1, r1), color, 2)
+        r0 = int(first_row * cell_px)
+        r1 = int((first_row + 1) * cell_px)
+        c0 = int(first_col * cell_px)
+        c1 = int((first_col + 1) * cell_px)
+        cv2.rectangle(debug_color, (c0, r0), (c1, r1), (255, 0, 0), 2)
 
-        # Pilotos negros en rojo
-        for row, col in PILOT_BLACK_POSITIONS:
-            r0 = int((row + border) * cell_px)
-            r1 = int((row + border + 1) * cell_px)
-            c0 = int((col + border) * cell_px)
-            c1 = int((col + border + 1) * cell_px)
-            cv2.rectangle(debug_color, (c0, r0), (c1, r1), (0, 0, 255), 2)
+        # Pilotos por color visual
+        colors = {
+            0: (0, 0, 255),
+            1: (0, 140, 255),
+            2: (0, 255, 255),
+            3: (0, 255, 0),
+        }
 
-        # Pilotos blancos en verde
-        for row, col in PILOT_WHITE_POSITIONS:
-            r0 = int((row + border) * cell_px)
-            r1 = int((row + border + 1) * cell_px)
-            c0 = int((col + border) * cell_px)
-            c1 = int((col + border + 1) * cell_px)
-            cv2.rectangle(debug_color, (c0, r0), (c1, r1), (0, 255, 0), 2)
+        for level, positions in PILOT_LEVEL_POSITIONS.items():
+            color = colors[level]
 
-        cv2.imwrite(os.path.join("debug_rx", "debug_bw_pilots.png"), debug_color)
+            for row, col in positions:
+                r0 = int(row * cell_px)
+                r1 = int((row + 1) * cell_px)
+                c0 = int(col * cell_px)
+                c1 = int((col + 1) * cell_px)
+                cv2.rectangle(debug_color, (c0, r0), (c1, r1), color, 2)
+
+        cv2.imwrite(os.path.join("debug_rx", "debug_bw_pilots_4levels.png"), debug_color)
         _debug_saved = True
 
     if DEBUG_VERBOSE:
-        print(f"Primera posición de datos: {DATA_POSITIONS[0]}")
-        print(f"cell_px: {cell_px:.2f}")
-        print(f"total_cells: {total_cells}")
+        lm = calibration["level_means"]
         print(
-            f"Calibración: modo={calibration['mode']} "
-            f"threshold={calibration['threshold']:.1f} "
-            f"black={calibration['black_mean']:.1f} "
-            f"white={calibration['white_mean']:.1f} "
-            f"contrast={calibration['contrast']:.1f}"
+            f"Calibración {calibration['mode']} | "
+            f"thr={calibration['binary_threshold']:.1f} | "
+            f"L0={lm[0]:.1f} L1={lm[1]:.1f} L2={lm[2]:.1f} L3={lm[3]:.1f}"
         )
 
-    bits = []
-
-    for i, (row, col) in enumerate(DATA_POSITIONS):
-        mean_val = cell_mean(warp_gray, row, col, cell_px, border)
-
-        if DEBUG_VERBOSE and i == 0:
-            print(
-                f"Celda ({row},{col}) -> mean={mean_val:.0f} "
-                f"threshold={threshold:.1f}"
-            )
-
-        bits.append(1 if mean_val >= threshold else 0)
-
-    return bits, calibration
+    return cell_means, binary_bits, calibration
 
 
 # ─────────────────────────── DETECTOR DE FIDUCIALES ──────────────────────────
@@ -542,9 +663,10 @@ def order_corners(fiducials):
 
 # ─────────────────────────── CLASE RECEPTOR ──────────────────────────────────
 class Rx:
-    def __init__(self, scale=PROCESS_SCALE, warp_size=WARP_SIZE):
+    def __init__(self, scale=PROCESS_SCALE, warp_size=WARP_SIZE, modulation="AUTO"):
         self.scale = scale
         self.warp_size = warp_size
+        self.modulation = modulation
         self.cap = None
         self.reset(announce=False)
 
@@ -554,21 +676,19 @@ class Rx:
         self._decoded_text = ""
         self._decoded_bits = []
 
-        self._last_symbol_bits = None
+        self._last_symbol_signature = None
         self._stable_count = 0
         self._required_stable = REQUIRED_STABLE
-        self._processed_symbol_ids = set()
+        self._processed_frame_keys = set()
 
         self._last_event_msg = ""
         self._last_calibration = None
+        self._last_detected_modulation = None
 
-        # Métricas de tiempo
         self._reset_time = time.time()
         self._first_ok_time = None
         self._complete_time = None
-        self._final_reported = False
 
-        # Métricas BER
         self._ber_metrics = None
         self._text_match = None
 
@@ -616,8 +736,9 @@ class Rx:
         print(f"Backend:    {self.cap.getBackendName()}")
         print(f"Warp size:  {self.warp_size}x{self.warp_size}")
         print(f"Scale:      {self.scale}")
+        print(f"Modo RX:    {self.modulation}")
         print(f"Estabilidad requerida: {self._required_stable}")
-        print(f"Pilotos:    {len(PILOT_BLACK_POSITIONS)} negros + {len(PILOT_WHITE_POSITIONS)} blancos")
+        print("Pilotos:    4 niveles × 4 pilotos = 16 pilotos")
 
         if ENABLE_BER_EVALUATION:
             print("BER:        habilitado contra texto de referencia local")
@@ -659,28 +780,38 @@ class Rx:
         received_bits = self._decoded_bits[:len(expected_bits)]
 
         self._ber_metrics = compute_ber(expected_bits, received_bits)
-        self._text_match = (self._decoded_text == EXPECTED_TEXT)
+        self._text_match = self._decoded_text == EXPECTED_TEXT
 
     def _print_final_metrics(self):
         tiempo_total, tiempo_desde_primer_ok = self._time_metrics()
 
+        if self._last_detected_modulation is not None:
+            print(f"\nModulación detectada/usada: {self._last_detected_modulation}")
+
         if tiempo_total is not None:
-            print(f"\nTiempo total desde reset RX: {tiempo_total:.2f} s")
+            print(f"Tiempo total desde reset RX: {tiempo_total:.2f} s")
 
         if tiempo_desde_primer_ok is not None:
             print(f"Tiempo desde primer FRAME OK: {tiempo_desde_primer_ok:.2f} s")
 
         if self._last_calibration is not None:
             c = self._last_calibration
+            lm = c["level_means"]
+            th = c["ask4_thresholds"]
+
             print("\nCalibración por pilotos:")
-            print(f"  Modo umbral:          {c['mode']}")
-            print(f"  Pilotos negros media: {c['black_mean']:.2f}")
-            print(f"  Pilotos blancos media:{c['white_mean']:.2f}")
-            print(f"  Contraste pilotos:    {c['contrast']:.2f}")
-            print(f"  Umbral usado:         {c['threshold']:.2f}")
+            print(f"  Modo umbral binario: {c['mode']}")
+            print(f"  L0 media:            {lm[0]:.2f}")
+            print(f"  L1 media:            {lm[1]:.2f}")
+            print(f"  L2 media:            {lm[2]:.2f}")
+            print(f"  L3 media:            {lm[3]:.2f}")
+            print(f"  Contraste binario:   {c['binary_contrast']:.2f}")
+            print(f"  Umbral binario:      {c['binary_threshold']:.2f}")
+            print(f"  Umbrales ASK4:       T01={th['T01']:.2f}, T12={th['T12']:.2f}, T23={th['T23']:.2f}")
 
         if ENABLE_BER_EVALUATION and self._ber_metrics is not None:
             m = self._ber_metrics
+
             print("\nMétricas BER:")
             print(f"  Caracteres esperados: {len(EXPECTED_TEXT)}")
             print(f"  Caracteres recibidos: {len(self._decoded_text)}")
@@ -720,10 +851,8 @@ class Rx:
     def process_frame(self, frame):
         debug = frame.copy()
 
-        roi = frame
-
         scaled = cv2.resize(
-            roi,
+            frame,
             None,
             fx=self.scale,
             fy=self.scale,
@@ -759,7 +888,6 @@ class Rx:
             return debug, None, self._decoded_text
 
         fiducials = detect_fiducials(bw, contours, hierarchy)
-
         offset = np.array([0, 0], dtype=np.float32)
 
         for f in fiducials:
@@ -774,7 +902,6 @@ class Rx:
             return debug, None, self._decoded_text
 
         sel = fiducials[:4] if len(fiducials) == 4 else self._best_four(fiducials)
-
         tl, tr, br, bl = order_corners(sel)
 
         pts_orig = (np.array([tl, tr, br, bl]) / self.scale + offset).astype(np.float32)
@@ -804,66 +931,78 @@ class Rx:
         warp = cv2.warpPerspective(frame, M, (ws, ws))
 
         warp_gray = cv2.cvtColor(warp, cv2.COLOR_BGR2GRAY)
-        bits, calibration = read_symbol_bits(warp_gray, border=0)
+
+        cell_means, binary_bits, calibration = read_symbol_cells(warp_gray, border=0)
         self._last_calibration = calibration
 
-        # ── Estabilidad temporal ─────────────────────────────────────────────
-        if self._last_symbol_bits is None:
-            self._last_symbol_bits = bits.copy()
+        # Firma simple para estabilidad.
+        # Se cuantizan medias para soportar ASK4 sin exigir igualdad exacta.
+        signature = tuple(int(v // 8) for v in cell_means[:200])
+
+        if self._last_symbol_signature is None:
+            self._last_symbol_signature = signature
             self._stable_count = 1
-        elif bits == self._last_symbol_bits:
+        elif signature == self._last_symbol_signature:
             self._stable_count += 1
         else:
-            self._last_symbol_bits = bits.copy()
+            self._last_symbol_signature = signature
             self._stable_count = 1
 
         symbol_just_processed = False
 
         if self._stable_count >= self._required_stable:
-            symbol_id = "".join(map(str, bits))
+            parsed = parse_and_decode_frame(
+                cell_means,
+                binary_bits,
+                calibration,
+                self.modulation
+            )
 
-            if symbol_id not in self._processed_symbol_ids:
-                self._processed_symbol_ids.add(symbol_id)
+            if parsed is None:
+                msg = "[FRAME descartado] preámbulo/cabecera inválidos"
+                self._last_event_msg = msg
 
-                if DEBUG_VERBOSE:
-                    preamble_bits = bits[:16]
-                    preamble_val = bits_to_int(preamble_bits)
-                    print(f"Preámbulo leído: {hex(preamble_val)} (esperado: {hex(PREAMBLE)})")
-                    print(f"Primeros 80 bits: {bits[:80]}")
+                if PRINT_INVALID_FRAMES:
+                    print(msg)
 
-                parsed = parse_frame(bits)
+            elif not parsed["crc_ok"]:
+                nf = parsed["n_frame"]
+                nt = parsed["n_total"]
+                mod = parsed["modulation"]
 
-                if parsed is None:
-                    msg = "[FRAME descartado] preámbulo/cabecera inválidos"
-                    self._last_event_msg = msg
+                msg = f"[{mod}] [FRAME #{nf + 1}/{nt} DESCARTADO] CRC error"
+                self._last_event_msg = msg
 
-                    if PRINT_INVALID_FRAMES:
-                        print(msg)
+                if PRINT_CRC_ERRORS:
+                    print(msg)
 
-                elif not parsed["crc_ok"]:
-                    nf = parsed["n_frame"]
-                    nt = parsed["n_total"]
+            else:
+                nf = parsed["n_frame"]
+                nt = parsed["n_total"]
+                mod = parsed["modulation"]
 
-                    msg = f"[FRAME #{nf + 1}/{nt} DESCARTADO] CRC error"
-                    self._last_event_msg = msg
+                frame_key = (
+                    mod,
+                    nf,
+                    nt,
+                    parsed["n_payload"],
+                    parsed["crc_rx"],
+                )
 
-                    if PRINT_CRC_ERRORS:
-                        print(msg)
-
-                else:
-                    nf = parsed["n_frame"]
-                    nt = parsed["n_total"]
+                if frame_key not in self._processed_frame_keys:
+                    self._processed_frame_keys.add(frame_key)
 
                     if self._first_ok_time is None:
                         self._first_ok_time = time.time()
 
+                    self._last_detected_modulation = mod
                     self._n_total_expected = nt
                     self._frame_store[nf] = parsed["payload"]
 
                     self._try_reconstruct()
 
                     msg = (
-                        f"[FRAME #{nf + 1}/{nt} OK] "
+                        f"[{mod}] [FRAME #{nf + 1}/{nt} OK] "
                         f"CRC ✓ | payload={parsed['n_payload']} bits | "
                         f"almacenados={len(self._frame_store)}/{nt} | "
                         f"texto={len(self._decoded_text)} chars"
@@ -915,14 +1054,15 @@ class Rx:
         )
 
         n_total = self._n_total_expected or "?"
+        mod = self._last_detected_modulation or self.modulation
 
         cv2.putText(
             debug,
-            f"Fiduciales OK | estable: {self._stable_count}/{self._required_stable} "
+            f"Modo={mod} | Fiduciales OK | estable: {self._stable_count}/{self._required_stable} "
             f"| frames: {len(self._frame_store)}/{n_total}",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
+            0.60,
             est_color,
             2
         )
@@ -935,20 +1075,22 @@ class Rx:
                 self._last_event_msg[:120],
                 (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.48,
                 color,
                 2
             )
 
         if self._last_calibration is not None:
             c = self._last_calibration
+            lm = c["level_means"]
+
             cv2.putText(
                 debug,
-                f"Cal: {c['mode']} thr={c['threshold']:.0f} "
-                f"B={c['black_mean']:.0f} W={c['white_mean']:.0f}",
+                f"Cal={c['mode']} thr={c['binary_threshold']:.0f} "
+                f"L0={lm[0]:.0f} L1={lm[1]:.0f} L2={lm[2]:.0f} L3={lm[3]:.0f}",
                 (10, 90),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
+                0.48,
                 (255, 255, 0),
                 2
             )
@@ -1011,7 +1153,7 @@ class Rx:
 
         overlay = img.copy()
 
-        # Celdas de datos
+        # Datos
         for row, col in DATA_POSITIONS:
             r0 = int(row * cell_px)
             c0 = int(col * cell_px)
@@ -1019,21 +1161,23 @@ class Rx:
             c1 = int((col + 1) * cell_px)
             cv2.rectangle(overlay, (c0, r0), (c1, r1), (255, 100, 0), -1)
 
-        # Pilotos negros
-        for row, col in PILOT_BLACK_POSITIONS:
-            r0 = int(row * cell_px)
-            c0 = int(col * cell_px)
-            r1 = int((row + 1) * cell_px)
-            c1 = int((col + 1) * cell_px)
-            cv2.rectangle(overlay, (c0, r0), (c1, r1), (0, 0, 255), -1)
+        # Pilotos
+        colors = {
+            0: (0, 0, 255),
+            1: (0, 140, 255),
+            2: (0, 255, 255),
+            3: (0, 255, 0),
+        }
 
-        # Pilotos blancos
-        for row, col in PILOT_WHITE_POSITIONS:
-            r0 = int(row * cell_px)
-            c0 = int(col * cell_px)
-            r1 = int((row + 1) * cell_px)
-            c1 = int((col + 1) * cell_px)
-            cv2.rectangle(overlay, (c0, r0), (c1, r1), (0, 255, 0), -1)
+        for level, positions in PILOT_LEVEL_POSITIONS.items():
+            color = colors[level]
+
+            for row, col in positions:
+                r0 = int(row * cell_px)
+                c0 = int(col * cell_px)
+                r1 = int((row + 1) * cell_px)
+                c1 = int((col + 1) * cell_px)
+                cv2.rectangle(overlay, (c0, r0), (c1, r1), color, -1)
 
         cv2.addWeighted(overlay, 0.12, img, 0.88, 0, img)
 
@@ -1042,16 +1186,17 @@ class Rx:
 
 # ─────────────────────────── MAIN LOOP ───────────────────────────────────────
 if __name__ == "__main__":
-    rx = Rx(scale=PROCESS_SCALE, warp_size=WARP_SIZE)
+    rx_mode = get_rx_modulation_from_args(RX_MODULATION)
+
+    rx = Rx(scale=PROCESS_SCALE, warp_size=WARP_SIZE, modulation=rx_mode)
     rx.open_camera(cam_id=0)
 
-    # Reset después de abrir cámara.
     rx.reset()
 
     print("Leyendo... 'q' para salir, 'r' para reiniciar decoder.")
     print("Tip: presiona 'r' cuando ya tengas la cámara bien apuntada al TX.")
-    print("Tip: este RX requiere el TX actualizado con pilotos explícitos.")
-    print("Tip: si no detecta cámara, cambia rx.open_camera(cam_id=0) por 1 o 2.")
+    print("Tip: RX en AUTO puede detectar OOK_MANCHESTER o ASK4_GRAY si el CRC pasa.")
+    print("Tip: para forzar modo: python rx.py OOK_MANCHESTER o python rx.py ASK4_GRAY.")
     print("Tip: si hay muchos CRC error, mejora enfoque/brillo o sube delay en TX.")
     print("Tip: para medir formalmente, usa el mismo EXPECTED_TEXT que transmite tx_final.py.\n")
 
