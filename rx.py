@@ -1474,13 +1474,6 @@ class Rx:
                 2
             )
 
-        if self._last_rolling_sync is not None and ENABLE_ROLLING_SHUTTER_BAND_GUARD:
-            valid_count = len(self._last_rolling_sync.get("valid", []))
-            print("\nSincronización temporal / rolling shutter:")
-            print("  Detector por bandas: TOP/MID/BOT con marcador + número de trama")
-            print(f"  Última lectura válida: {valid_count}/3 bandas")
-            print(f"  Estado bandas: {self._last_rolling_sync.get('summary', '')}")
-
         if self._last_calibration is not None:
             c = self._last_calibration
             lm = c["level_means"]
@@ -1610,7 +1603,7 @@ if __name__ == "__main__":
     print(f"Demodulador activo: {rx_mode}")
     print(f"Modo de enlace: {COMMUNICATION_MODE}")
     print("Sincronización: preámbulo + secuencia + flag fin + CRC")
-    print("Mitigación rolling shutter: guardia temporal/calibración + descarte CRC")
+    print("Mitigación rolling shutter: detector TOP/MID/BOT + guardia calibración + CRC")
     print("Muestreo: centro de macropíxel + filtro espacial/estadística robusta")
     print("Comandos: 'q' salir | 'r' reiniciar medición")
     print("Para pruebas formales usa modo forzado:")
