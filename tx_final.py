@@ -10,23 +10,29 @@ import numpy as np
 
 
 # ─────────────────────────── CONFIGURACIÓN DE TX ─────────────────────────────
-# Modo principal estable:
-#   OOK_MANCHESTER
+# Modos disponibles:
+#   OOK_MANCHESTER  → modo principal estable
+#   ASK4_GRAY       → segunda modulación física con repetición espacial
 #
-# Segunda modulación física:
-#   ASK4_GRAY
-#
-# También puedes seleccionar por consola:
+# Uso:
 #   python tx_final.py OOK_MANCHESTER
 #   python tx_final.py ASK4_GRAY
 MODULATION = "OOK_MANCHESTER"
 
 SYMBOL_SIZE = 40
-TX_DELAY = 0.05
+
+# Delay por modulación
+TX_DELAY_OOK = 0.05
+TX_DELAY_ASK4 = 0.20
+
 FULLSCREEN = True
 SAVE_FIRST_FRAME_PNG = True
 SAVE_MODULATION_EXAMPLES = True
 RUN_DIGITAL_LOOPBACK_TEST = True
+
+# Repetición espacial para 4ASK:
+# cada símbolo 4ASK, que representa 2 bits, se dibuja en 3 celdas consecutivas.
+ASK4_REPEAT = 3
 
 
 # ─────────────────────────── TEXTO DE PRUEBA ─────────────────────────────────
@@ -136,6 +142,12 @@ def get_modulation_from_args(default: str) -> str:
     return default
 
 
+def tx_delay_for_modulation(modulation: str) -> float:
+    if modulation == "ASK4_GRAY":
+        return TX_DELAY_ASK4
+    return TX_DELAY_OOK
+
+
 # ─────────────────────────── CLASE TX ────────────────────────────────────────
 class Tx:
     # Cabecera
@@ -165,7 +177,7 @@ class Tx:
     }
 
     # Pilotos de 4 niveles.
-    # Estos mismos deben existir en rx.py.
+    # Deben coincidir exactamente con rx.py.
     PILOT_LEVEL_POSITIONS = {
         0: [
             (8, 8), (31, 31),
@@ -185,13 +197,13 @@ class Tx:
         ],
     }
 
-    # Niveles físicos para 4-ASK.
-    # Cada celda representa 2 bits.
+    # Niveles físicos para ASK4.
+    # Se separan bien para que la cámara pueda distinguirlos mejor.
     ASK4_BITS_TO_LEVEL = {
-        (0, 0): 0.15,
-        (0, 1): 0.40,
-        (1, 0): 0.65,
-        (1, 1): 0.90,
+        (0, 0): 0.05,
+        (0, 1): 0.35,
+        (1, 0): 0.70,
+        (1, 1): 0.95,
     }
 
     ASK4_LEVEL_TO_BITS = {
@@ -202,13 +214,18 @@ class Tx:
     }
 
     ASK4_LEVEL_VALUES = {
-        0: 0.15,
-        1: 0.40,
-        2: 0.65,
-        3: 0.90,
+        0: 0.05,
+        1: 0.35,
+        2: 0.70,
+        3: 0.95,
     }
 
-    def __init__(self, symbol_size: int = 40, modulation: str = "OOK_MANCHESTER"):
+    def __init__(
+        self,
+        symbol_size: int = 40,
+        modulation: str = "OOK_MANCHESTER",
+        ask4_repeat: int = ASK4_REPEAT,
+    ):
         modulation = modulation.upper()
 
         if modulation not in self.VALID_MODULATIONS:
@@ -223,8 +240,12 @@ class Tx:
                 f"Mínimo: {2 * (self.FID_SIZE + self.QUIET) + 1}"
             )
 
+        if ask4_repeat < 1:
+            raise ValueError("ASK4_REPEAT debe ser >= 1")
+
         self.symbol_size = symbol_size
         self.modulation = modulation
+        self.ask4_repeat = ask4_repeat
 
         self._reserved_mask = self._build_reserved_mask()
         self._data_positions = self._build_data_positions()
@@ -241,8 +262,12 @@ class Tx:
 
         if self.modulation == "OOK_MANCHESTER":
             self._payload_bits_per_frame = self._payload_cells // 2
+
         elif self.modulation == "ASK4_GRAY":
-            self._payload_bits_per_frame = self._payload_cells * 2
+            # Cada símbolo 4ASK representa 2 bits, pero se repite ask4_repeat veces.
+            usable_ask4_symbols = self._payload_cells // self.ask4_repeat
+            self._payload_bits_per_frame = usable_ask4_symbols * 2
+
         else:
             raise RuntimeError("Modulación no reconocida.")
 
@@ -318,8 +343,8 @@ class Tx:
 
     def _pilot_value_for_level(self, level: int) -> float:
         if self.modulation == "OOK_MANCHESTER":
-            # En OOK dejamos pilotos de dos niveles físicos:
-            # niveles 0 y 1 como negro; niveles 2 y 3 como blanco.
+            # En OOK usamos los pilotos como referencia binaria:
+            # niveles 0 y 1 negros, niveles 2 y 3 blancos.
             return 0.0 if level in (0, 1) else 1.0
 
         if self.modulation == "ASK4_GRAY":
@@ -372,29 +397,40 @@ class Tx:
         return dec
 
     @classmethod
-    def _ask4_encode(cls, bits: list[int]) -> list[float]:
+    def _ask4_encode(cls, bits: list[int], repeat: int) -> list[float]:
         cells = []
 
         for i in range(0, len(bits), 2):
             b0 = bits[i]
             b1 = bits[i + 1] if i + 1 < len(bits) else 0
-            cells.append(cls.ASK4_BITS_TO_LEVEL[(b0, b1)])
+            level_value = cls.ASK4_BITS_TO_LEVEL[(b0, b1)]
+
+            # Repetición espacial
+            for _ in range(repeat):
+                cells.append(level_value)
 
         return cells
 
     @classmethod
-    def _ask4_decode_ideal(cls, cells: list[float], n_bits: int) -> list[int]:
+    def _ask4_decode_ideal(cls, cells: list[float], n_bits: int, repeat: int) -> list[int]:
         levels = [
-            (0.15, (0, 0)),
-            (0.40, (0, 1)),
-            (0.65, (1, 0)),
-            (0.90, (1, 1)),
+            (cls.ASK4_LEVEL_VALUES[0], (0, 0)),
+            (cls.ASK4_LEVEL_VALUES[1], (0, 1)),
+            (cls.ASK4_LEVEL_VALUES[2], (1, 0)),
+            (cls.ASK4_LEVEL_VALUES[3], (1, 1)),
         ]
 
         decoded = []
 
-        for value in cells:
-            _, bits_pair = min(levels, key=lambda item: abs(float(value) - item[0]))
+        for i in range(0, len(cells), repeat):
+            group = cells[i:i + repeat]
+
+            if not group:
+                break
+
+            value = float(np.median(group))
+            _, bits_pair = min(levels, key=lambda item: abs(value - item[0]))
+
             decoded.extend(list(bits_pair))
 
             if len(decoded) >= n_bits:
@@ -457,7 +493,7 @@ class Tx:
                 pad_value = 1.0
 
             elif self.modulation == "ASK4_GRAY":
-                payload_cells = self._ask4_encode(real_bits)
+                payload_cells = self._ask4_encode(real_bits, self.ask4_repeat)
                 pad_value = 1.0
 
             else:
@@ -563,9 +599,14 @@ class Tx:
                     continue
 
             elif self.modulation == "ASK4_GRAY":
-                payload_cells_count = math.ceil(n_payload / 2)
+                ask4_symbols = math.ceil(n_payload / 2)
+                payload_cells_count = ask4_symbols * self.ask4_repeat
                 payload_cells = frame_cells[payload_start:payload_start + payload_cells_count]
-                payload_bits = self._ask4_decode_ideal(payload_cells, n_payload)
+                payload_bits = self._ask4_decode_ideal(
+                    payload_cells,
+                    n_payload,
+                    self.ask4_repeat
+                )
 
             else:
                 invalid_count += 1
@@ -680,7 +721,13 @@ class Tx:
         print(f"Modulación activa: {self.modulation}")
         print(f"Delay por trama: {delay:.3f} s")
         print(f"Tramas por ciclo: {n}")
-        print(f"Tiempo ideal de ciclo TX: {n * delay:.3f} s\n")
+        print(f"Tiempo ideal de ciclo TX: {n * delay:.3f} s")
+
+        if self.modulation == "ASK4_GRAY":
+            print(f"ASK4_REPEAT: {self.ask4_repeat}")
+            print("4ASK usa repetición espacial para mejorar robustez física.\n")
+        else:
+            print("")
 
         image_artist = None
 
@@ -746,7 +793,8 @@ class Tx:
             print(f"Aprox. chars útiles/frame: {pb // 8}")
 
         elif self.modulation == "ASK4_GRAY":
-            print(f"Payload 4-ASK: {pc} celdas → {pb} bits útiles/frame")
+            print(f"Payload 4ASK con repetición {self.ask4_repeat}×")
+            print(f"{pc} celdas payload → {pb} bits útiles/frame")
             print(f"Aprox. chars útiles/frame: {pb // 8}")
 
         if self.vec_imgs is not None and self._texto is not None:
@@ -767,13 +815,17 @@ def save_modulation_examples(texto: str) -> None:
     tx_ook.encode(texto)
     tx_ook.save_first_frame(os.path.join("debug_tx", "frame_OOK_MANCHESTER.png"))
 
-    tx_ask4 = Tx(symbol_size=SYMBOL_SIZE, modulation="ASK4_GRAY")
+    tx_ask4 = Tx(
+        symbol_size=SYMBOL_SIZE,
+        modulation="ASK4_GRAY",
+        ask4_repeat=ASK4_REPEAT,
+    )
     tx_ask4.encode(texto)
-    tx_ask4.save_first_frame(os.path.join("debug_tx", "frame_ASK4_GRAY.png"))
+    tx_ask4.save_first_frame(os.path.join("debug_tx", "frame_ASK4_GRAY_REPEAT3.png"))
 
     print("Ejemplos de modulación guardados en debug_tx:")
     print("  - frame_OOK_MANCHESTER.png")
-    print("  - frame_ASK4_GRAY.png")
+    print("  - frame_ASK4_GRAY_REPEAT3.png")
     print("")
 
 
@@ -791,11 +843,20 @@ if __name__ == "__main__":
         tx_test_ook.print_loopback_report()
 
         print("Prueba interna ASK4_GRAY")
-        tx_test_ask = Tx(symbol_size=SYMBOL_SIZE, modulation="ASK4_GRAY")
+        tx_test_ask = Tx(
+            symbol_size=SYMBOL_SIZE,
+            modulation="ASK4_GRAY",
+            ask4_repeat=ASK4_REPEAT,
+        )
         tx_test_ask.encode(DEMO_TEXT)
         tx_test_ask.print_loopback_report()
 
-    tx = Tx(symbol_size=SYMBOL_SIZE, modulation=modulation)
+    tx = Tx(
+        symbol_size=SYMBOL_SIZE,
+        modulation=modulation,
+        ask4_repeat=ASK4_REPEAT,
+    )
+
     tx.encode(DEMO_TEXT)
     tx.info()
     tx.print_loopback_report()
@@ -803,4 +864,5 @@ if __name__ == "__main__":
     if SAVE_FIRST_FRAME_PNG:
         tx.save_first_frame("tx_first_frame.png")
 
-    tx.draw(delay=TX_DELAY, fullscreen=FULLSCREEN)
+    tx_delay = tx_delay_for_modulation(modulation)
+    tx.draw(delay=tx_delay, fullscreen=FULLSCREEN)

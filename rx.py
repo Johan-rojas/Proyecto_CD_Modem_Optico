@@ -9,15 +9,15 @@ import numpy as np
 
 
 # ─────────────────────────── CONFIGURACIÓN GENERAL ───────────────────────────
-# RX_MODULATION:
-#   "AUTO"            = intenta OOK_MANCHESTER y ASK4_GRAY automáticamente.
-#   "OOK_MANCHESTER" = fuerza OOK + Manchester.
-#   "ASK4_GRAY"      = fuerza 4-ASK en escala de grises.
+# Modos:
+#   AUTO
+#   OOK_MANCHESTER
+#   ASK4_GRAY
 #
-# También puedes seleccionar por consola:
-#   python rx.py AUTO
+# Uso:
 #   python rx.py OOK_MANCHESTER
 #   python rx.py ASK4_GRAY
+#   python rx.py AUTO
 RX_MODULATION = "AUTO"
 
 SYMBOL_SIZE = 40
@@ -32,6 +32,10 @@ CAMERA_FPS = 30
 
 WARP_SIZE = 800
 PROCESS_SCALE = 0.5
+
+# OOK funciona bien con 1.
+# ASK4 es más delicado. La robustez la da ASK4_REPEAT, pero dejamos estabilidad en 1
+# para no volver demasiado lento el sistema.
 REQUIRED_STABLE = 1
 
 DEBUG_VERBOSE = False
@@ -40,6 +44,8 @@ PRINT_CRC_ERRORS = True
 SAVE_DEBUG_IMAGE = True
 
 ENABLE_BER_EVALUATION = True
+
+ASK4_REPEAT = 3
 
 EXPECTED_TEXT = (
     "La vision artificial permite interpretar imagenes mediante algoritmos "
@@ -158,7 +164,8 @@ DATA_CELLS = len(DATA_POSITIONS)
 PAYLOAD_CELLS = DATA_CELLS - HEADER_BITS
 
 OOK_MAX_PAYLOAD_BITS_PER_FRAME = PAYLOAD_CELLS // 2
-ASK4_MAX_PAYLOAD_BITS_PER_FRAME = PAYLOAD_CELLS * 2
+ASK4_MAX_PAYLOAD_BITS_PER_FRAME = (PAYLOAD_CELLS // ASK4_REPEAT) * 2
+
 BROAD_MAX_PAYLOAD_BITS_PER_FRAME = max(
     OOK_MAX_PAYLOAD_BITS_PER_FRAME,
     ASK4_MAX_PAYLOAD_BITS_PER_FRAME,
@@ -316,6 +323,11 @@ def parse_common_header(binary_bits: list[int]):
 
 
 def ask4_decode_from_means(payload_means: list[float], n_bits: int, calibration: dict) -> list[int]:
+    """
+    Decodifica ASK4 con repetición espacial.
+    Cada símbolo 4ASK ocupa ASK4_REPEAT celdas.
+    Se usa la mediana de esas celdas para reducir ruido.
+    """
     level_means = calibration["level_means"]
 
     decoded = []
@@ -327,10 +339,17 @@ def ask4_decode_from_means(payload_means: list[float], n_bits: int, calibration:
         3: (1, 1),
     }
 
-    for value in payload_means:
+    for i in range(0, len(payload_means), ASK4_REPEAT):
+        group = payload_means[i:i + ASK4_REPEAT]
+
+        if not group:
+            break
+
+        value = float(np.median(group))
+
         nearest_level = min(
             [0, 1, 2, 3],
-            key=lambda level: abs(float(value) - level_means[level])
+            key=lambda level: abs(value - level_means[level])
         )
 
         decoded.extend(list(level_to_bits[nearest_level]))
@@ -381,7 +400,9 @@ def try_decode_payload_ask4(cell_means: list[float], header: dict, calibration: 
     if n_payload > ASK4_MAX_PAYLOAD_BITS_PER_FRAME:
         return None
 
-    needed_cells = math.ceil(n_payload / 2)
+    ask4_symbols = math.ceil(n_payload / 2)
+    needed_cells = ask4_symbols * ASK4_REPEAT
+
     start = HEADER_BITS
     end = start + needed_cells
 
@@ -429,12 +450,12 @@ def parse_and_decode_frame(cell_means: list[float], binary_bits: list[int], cali
     if not candidates:
         return None
 
-    # En AUTO se acepta el que pase CRC.
-    for c in candidates:
-        if c["crc_ok"]:
-            return c
+    # En AUTO se acepta el primero que pase CRC.
+    for candidate in candidates:
+        if candidate["crc_ok"]:
+            return candidate
 
-    # Si ninguno pasa CRC, devolver el primero para reportar error.
+    # Si ninguno pasa, se devuelve un candidato para reportar CRC error.
     return candidates[0]
 
 
@@ -493,7 +514,6 @@ def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0)
         binary_threshold = float(otsu_threshold)
         mode = "OTSU_FALLBACK"
 
-    # Umbrales descriptivos para 4-ASK.
     ask4_thresholds = {
         "T01": (level_means[0] + level_means[1]) / 2.0,
         "T12": (level_means[1] + level_means[2]) / 2.0,
@@ -739,6 +759,7 @@ class Rx:
         print(f"Modo RX:    {self.modulation}")
         print(f"Estabilidad requerida: {self._required_stable}")
         print("Pilotos:    4 niveles × 4 pilotos = 16 pilotos")
+        print(f"ASK4_REPEAT: {ASK4_REPEAT}")
 
         if ENABLE_BER_EVALUATION:
             print("BER:        habilitado contra texto de referencia local")
@@ -807,7 +828,12 @@ class Rx:
             print(f"  L3 media:            {lm[3]:.2f}")
             print(f"  Contraste binario:   {c['binary_contrast']:.2f}")
             print(f"  Umbral binario:      {c['binary_threshold']:.2f}")
-            print(f"  Umbrales ASK4:       T01={th['T01']:.2f}, T12={th['T12']:.2f}, T23={th['T23']:.2f}")
+            print(
+                f"  Umbrales ASK4:       "
+                f"T01={th['T01']:.2f}, "
+                f"T12={th['T12']:.2f}, "
+                f"T23={th['T23']:.2f}"
+            )
 
         if ENABLE_BER_EVALUATION and self._ber_metrics is not None:
             m = self._ber_metrics
@@ -936,7 +962,6 @@ class Rx:
         self._last_calibration = calibration
 
         # Firma simple para estabilidad.
-        # Se cuantizan medias para soportar ASK4 sin exigir igualdad exacta.
         signature = tuple(int(v // 8) for v in cell_means[:200])
 
         if self._last_symbol_signature is None:
@@ -1195,9 +1220,10 @@ if __name__ == "__main__":
 
     print("Leyendo... 'q' para salir, 'r' para reiniciar decoder.")
     print("Tip: presiona 'r' cuando ya tengas la cámara bien apuntada al TX.")
-    print("Tip: RX en AUTO puede detectar OOK_MANCHESTER o ASK4_GRAY si el CRC pasa.")
-    print("Tip: para forzar modo: python rx.py OOK_MANCHESTER o python rx.py ASK4_GRAY.")
-    print("Tip: si hay muchos CRC error, mejora enfoque/brillo o sube delay en TX.")
+    print("Tip: para OOK usa:  python rx.py OOK_MANCHESTER")
+    print("Tip: para 4ASK usa: python rx.py ASK4_GRAY")
+    print("Tip: RX en AUTO puede detectar ambos, pero para pruebas formales es mejor forzar modo.")
+    print("Tip: si hay muchos CRC error en 4ASK, usa buena iluminación, enfoque fijo y distancia corta.")
     print("Tip: para medir formalmente, usa el mismo EXPECTED_TEXT que transmite tx_final.py.\n")
 
     last_time = time.time()
