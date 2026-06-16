@@ -40,8 +40,9 @@ REQUIRED_STABLE = 1
 
 DEBUG_VERBOSE = False
 PRINT_INVALID_FRAMES = False
-PRINT_CRC_ERRORS = True
+PRINT_CRC_ERRORS = False
 SAVE_DEBUG_IMAGE = True
+PRINT_FPS_EVERY_SECOND = False
 
 ENABLE_BER_EVALUATION = True
 
@@ -700,6 +701,11 @@ class Rx:
         self._stable_count = 0
         self._required_stable = REQUIRED_STABLE
         self._processed_frame_keys = set()
+        self._invalid_header_count = 0
+        self._crc_error_counts = {
+            "OOK_MANCHESTER": 0,
+            "ASK4_GRAY": 0,
+        }
 
         self._last_event_msg = ""
         self._last_calibration = None
@@ -814,6 +820,17 @@ class Rx:
 
         if tiempo_desde_primer_ok is not None:
             print(f"Tiempo desde primer FRAME OK: {tiempo_desde_primer_ok:.2f} s")
+
+        if self._n_total_expected is not None:
+            print(f"Tramas válidas recibidas: {len(self._frame_store)}/{self._n_total_expected}")
+
+        total_crc_errors = sum(self._crc_error_counts.values())
+        if self._invalid_header_count or total_crc_errors:
+            print("\nTramas descartadas:")
+            print(f"  Cabecera/preámbulo inválido: {self._invalid_header_count}")
+            for mod_name, count in self._crc_error_counts.items():
+                if count:
+                    print(f"  CRC error {mod_name}: {count}")
 
         if self._last_calibration is not None:
             c = self._last_calibration
@@ -984,6 +1001,7 @@ class Rx:
             )
 
             if parsed is None:
+                self._invalid_header_count += 1
                 msg = "[FRAME descartado] preámbulo/cabecera inválidos"
                 self._last_event_msg = msg
 
@@ -994,6 +1012,7 @@ class Rx:
                 nf = parsed["n_frame"]
                 nt = parsed["n_total"]
                 mod = parsed["modulation"]
+                self._crc_error_counts[mod] = self._crc_error_counts.get(mod, 0) + 1
 
                 msg = f"[{mod}] [FRAME #{nf + 1}/{nt} DESCARTADO] CRC error"
                 self._last_event_msg = msg
@@ -1218,13 +1237,15 @@ if __name__ == "__main__":
 
     rx.reset()
 
-    print("Leyendo... 'q' para salir, 'r' para reiniciar decoder.")
-    print("Tip: presiona 'r' cuando ya tengas la cámara bien apuntada al TX.")
-    print("Tip: para OOK usa:  python rx.py OOK_MANCHESTER")
-    print("Tip: para 4ASK usa: python rx.py ASK4_GRAY")
-    print("Tip: RX en AUTO puede detectar ambos, pero para pruebas formales es mejor forzar modo.")
-    print("Tip: si hay muchos CRC error en 4ASK, usa buena iluminación, enfoque fijo y distancia corta.")
-    print("Tip: para medir formalmente, usa el mismo EXPECTED_TEXT que transmite tx_final.py.\n")
+    print("=" * 70)
+    print("RX - MODEM OPTICO")
+    print(f"Demodulador activo: {rx_mode}")
+    print("Comandos: 'q' salir | 'r' reiniciar medición")
+    print("Para pruebas formales usa modo forzado:")
+    print("  python rx.py OOK_MANCHESTER")
+    print("  python rx.py ASK4_GRAY")
+    print("=" * 70)
+    print("")
 
     last_time = time.time()
     fps_count = 0
@@ -1240,7 +1261,8 @@ if __name__ == "__main__":
             fps_count += 1
 
             if time.time() - last_time >= 1:
-                print(f"FPS reales: {fps_count}")
+                if PRINT_FPS_EVERY_SECOND:
+                    print(f"FPS reales: {fps_count}")
                 fps_count = 0
                 last_time = time.time()
 
@@ -1261,17 +1283,21 @@ if __name__ == "__main__":
                 final_printed = False
 
             if text and not final_printed:
-                print("\n\nTexto completo decodificado:")
+                print("\n" + "=" * 70)
+                print("DECODIFICACIÓN COMPLETA")
+                print("=" * 70)
+                print("Texto completo decodificado:")
                 print(text)
 
                 rx._print_final_metrics()
 
-                print()
+                print("=" * 70)
+                print("Puedes presionar 'q' para salir o 'r' para reiniciar.\n")
                 final_printed = True
 
     finally:
-        print(f"\n\nTexto final decodificado:\n{rx._decoded_text}")
-
-        rx._print_final_metrics()
+        if not final_printed:
+            print(f"\n\nTexto final decodificado:\n{rx._decoded_text}")
+            rx._print_final_metrics()
 
         rx.close_camera()

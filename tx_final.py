@@ -26,9 +26,12 @@ TX_DELAY_OOK = 0.10
 TX_DELAY_ASK4 = 0.10
 
 FULLSCREEN = True
-SAVE_FIRST_FRAME_PNG = True
-SAVE_MODULATION_EXAMPLES = True
-RUN_DIGITAL_LOOPBACK_TEST = True
+
+# Modo limpio para sustentación:
+# False evita salidas extra antes de abrir la ventana de transmisión.
+SAVE_FIRST_FRAME_PNG = False
+SAVE_MODULATION_EXAMPLES = False
+RUN_DIGITAL_LOOPBACK_TEST = False
 
 # Repetición espacial para 4ASK:
 # cada símbolo 4ASK, que representa 2 bits, se dibuja en 3 celdas consecutivas.
@@ -832,6 +835,11 @@ def save_modulation_examples(texto: str) -> None:
 # ─────────────────────────────── MAIN ────────────────────────────────────────
 if __name__ == "__main__":
     modulation = get_modulation_from_args(MODULATION)
+
+    print("=" * 70)
+    print("TX - MODEM OPTICO")
+    print(f"Modulación seleccionada: {modulation}")
+    print("=" * 70)
 
     if SAVE_MODULATION_EXAMPLES:
         save_modulation_examples(DEMO_TEXT)
