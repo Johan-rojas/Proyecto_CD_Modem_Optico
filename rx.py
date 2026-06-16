@@ -764,8 +764,15 @@ class Rx:
         print(f"Scale:      {self.scale}")
         print(f"Modo RX:    {self.modulation}")
         print(f"Estabilidad requerida: {self._required_stable}")
-        print("Pilotos:    4 niveles × 4 pilotos = 16 pilotos")
-        print(f"ASK4_REPEAT: {ASK4_REPEAT}")
+
+        if self.modulation == "OOK_MANCHESTER":
+            print("Pilotos:    binarios por referencia negro/blanco")
+        elif self.modulation == "ASK4_GRAY":
+            print("Pilotos:    4 niveles × 4 pilotos = 16 pilotos")
+            print(f"ASK4_REPEAT: {ASK4_REPEAT}")
+        else:
+            print("Pilotos:    compatibles con OOK y ASK4")
+            print(f"ASK4_REPEAT: {ASK4_REPEAT}")
 
         if ENABLE_BER_EVALUATION:
             print("BER:        habilitado contra texto de referencia local")
@@ -837,20 +844,38 @@ class Rx:
             lm = c["level_means"]
             th = c["ask4_thresholds"]
 
-            print("\nCalibración por pilotos:")
-            print(f"  Modo umbral binario: {c['mode']}")
-            print(f"  L0 media:            {lm[0]:.2f}")
-            print(f"  L1 media:            {lm[1]:.2f}")
-            print(f"  L2 media:            {lm[2]:.2f}")
-            print(f"  L3 media:            {lm[3]:.2f}")
-            print(f"  Contraste binario:   {c['binary_contrast']:.2f}")
-            print(f"  Umbral binario:      {c['binary_threshold']:.2f}")
-            print(
-                f"  Umbrales ASK4:       "
-                f"T01={th['T01']:.2f}, "
-                f"T12={th['T12']:.2f}, "
-                f"T23={th['T23']:.2f}"
-            )
+            # Elegimos qué mostrar según el demodulador realmente usado.
+            active_mod = self._last_detected_modulation or self.modulation
+
+            if active_mod == "OOK_MANCHESTER":
+                print("\nCalibración binaria por pilotos:")
+                print(f"  Modo umbral:          {c['mode']}")
+                print(f"  Referencia negra:     {c['binary_black']:.2f}")
+                print(f"  Referencia blanca:    {c['binary_white']:.2f}")
+                print(f"  Contraste binario:    {c['binary_contrast']:.2f}")
+                print(f"  Umbral usado:         {c['binary_threshold']:.2f}")
+
+            elif active_mod == "ASK4_GRAY":
+                print("\nCalibración ASK4 por pilotos:")
+                print(f"  Modo umbral binario: {c['mode']}")
+                print(f"  Nivel 0 media:       {lm[0]:.2f}")
+                print(f"  Nivel 1 media:       {lm[1]:.2f}")
+                print(f"  Nivel 2 media:       {lm[2]:.2f}")
+                print(f"  Nivel 3 media:       {lm[3]:.2f}")
+                print(f"  Contraste binario:   {c['binary_contrast']:.2f}")
+                print(f"  Umbral binario:      {c['binary_threshold']:.2f}")
+                print(
+                    f"  Umbrales ASK4:       "
+                    f"T01={th['T01']:.2f}, "
+                    f"T12={th['T12']:.2f}, "
+                    f"T23={th['T23']:.2f}"
+                )
+
+            else:
+                print("\nCalibración por pilotos:")
+                print(f"  Modo umbral binario: {c['mode']}")
+                print(f"  Contraste binario:   {c['binary_contrast']:.2f}")
+                print(f"  Umbral binario:      {c['binary_threshold']:.2f}")
 
         if ENABLE_BER_EVALUATION and self._ber_metrics is not None:
             m = self._ber_metrics
