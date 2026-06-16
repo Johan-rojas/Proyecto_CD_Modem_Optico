@@ -373,7 +373,7 @@ def order_corners(fiducials):
 
 # ─────────────────────────── CLASE RECEPTOR ──────────────────────────────────
 class Rx:
-    def __init__(self, scale=1, warp_size=WARP_SIZE):
+    def __init__(self, scale=0.5, warp_size=WARP_SIZE):
         self.scale = scale
         self.warp_size = warp_size
         self.cap = None
@@ -743,7 +743,7 @@ class Rx:
 
 # ─────────────────────────── MAIN LOOP ───────────────────────────────────────
 if __name__ == "__main__":
-    rx = Rx(scale=1, warp_size=WARP_SIZE)
+    rx = Rx(scale=0.5, warp_size=WARP_SIZE)
     rx.open_camera(cam_id=0)
 
     print("Leyendo... 'q' para salir, 'r' para reiniciar decoder.")
