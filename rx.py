@@ -31,7 +31,7 @@ CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 
 WARP_SIZE = 800
-PROCESS_SCALE = 0.5
+PROCESS_SCALE = 1
 
 # OOK funciona bien con 1.
 # ASK4 es más delicado. La robustez la da ASK4_REPEAT, pero dejamos estabilidad en 1
