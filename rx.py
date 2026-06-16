@@ -44,6 +44,32 @@ PRINT_CRC_ERRORS = False
 SAVE_DEBUG_IMAGE = True
 PRINT_FPS_EVERY_SECOND = False
 
+# Filtros y mitigaciones exigidas por la guía.
+COMMUNICATION_MODE = "HALF_DUPLEX"
+CELL_STATISTIC = "TRIMMED_MEAN"      # MEDIAN o TRIMMED_MEAN
+CELL_CENTER_MARGIN_FRACTION = 0.20    # se muestrea el centro del macropíxel
+ENABLE_MEDIAN_SPATIAL_FILTER = True   # reduce reflejos puntuales/ruido
+ENABLE_CALIBRATION_GUARD = True       # descarta capturas con pilotos incoherentes
+MIN_ASK4_LEVEL_GAP = 12.0             # separación mínima entre niveles ASK4
+
+# Detector explícito de rolling shutter por bandas temporales.
+# No reconstruye filas; detecta capturas mezcladas arriba/medio/abajo y las descarta.
+ENABLE_ROLLING_SHUTTER_BAND_GUARD = True
+ROLLING_SYNC_MARKER = 0b1010
+ROLLING_SYNC_MARKER_BITS = 4
+ROLLING_SYNC_FRAME_BITS = 4
+ROLLING_SYNC_TOTAL_BITS = 4
+ROLLING_SYNC_BITS = (
+    ROLLING_SYNC_MARKER_BITS +
+    ROLLING_SYNC_FRAME_BITS +
+    ROLLING_SYNC_TOTAL_BITS
+)
+ROLLING_SYNC_BANDS = {
+    "TOP": [(9, c) for c in range(12, 24)],
+    "MID": [(19, c) for c in range(12, 24)],
+    "BOT": [(30, c) for c in range(12, 24)],
+}
+
 ENABLE_BER_EVALUATION = True
 
 ASK4_REPEAT = 3
@@ -93,13 +119,18 @@ PREAMBLE_BITS = 16
 NTOTAL_BITS = 16
 NFRAME_BITS = 16
 NPAYLOAD_BITS = 16
+FRAME_FLAGS_BITS = 8
 CHECKSUM_BITS = 16
+
+# Bit 0 = última trama del mensaje. Funciona como delimitador explícito de fin.
+FLAG_LAST_FRAME = 0x01
 
 HEADER_BITS = (
     PREAMBLE_BITS +
     NTOTAL_BITS +
     NFRAME_BITS +
     NPAYLOAD_BITS +
+    FRAME_FLAGS_BITS +
     CHECKSUM_BITS
 )
 
@@ -121,12 +152,37 @@ def get_rx_modulation_from_args(default: str) -> str:
     return mode
 
 
+def load_expected_text_from_args(default_text: str) -> str:
+    """
+    Permite usar el mismo archivo .txt que transmite el TX para calcular BER:
+        python rx.py OOK_MANCHESTER mensaje.txt
+        python rx.py ASK4_GRAY mensaje.txt
+    Si no se pasa archivo, usa EXPECTED_TEXT.
+    """
+    if len(sys.argv) >= 3:
+        path = sys.argv[2]
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+
+    return default_text
+
+
 # ─────────────────────────── MÁSCARAS ESPACIALES ─────────────────────────────
 def all_pilot_positions() -> list[tuple[int, int]]:
     positions = []
 
     for pts in PILOT_LEVEL_POSITIONS.values():
         positions.extend(pts)
+
+    return positions
+
+
+def all_rolling_sync_positions() -> list[tuple[int, int]]:
+    positions = []
+
+    if ENABLE_ROLLING_SHUTTER_BAND_GUARD:
+        for pts in ROLLING_SYNC_BANDS.values():
+            positions.extend(pts)
 
     return positions
 
@@ -147,6 +203,12 @@ def build_reserved_mask(N=SYMBOL_SIZE, FQ=FQ):
     for r, c in all_pilot_positions():
         if not (0 <= r < N and 0 <= c < N):
             raise ValueError(f"Piloto fuera de la grilla: {(r, c)}")
+        mask[r, c] = True
+
+    # Bandas temporales usadas para detectar rolling shutter
+    for r, c in all_rolling_sync_positions():
+        if not (0 <= r < N and 0 <= c < N):
+            raise ValueError(f"Celda rolling sync fuera de la grilla: {(r, c)}")
         mask[r, c] = True
 
     return mask
@@ -300,6 +362,9 @@ def parse_common_header(binary_bits: list[int]):
     n_payload = bits_to_int(binary_bits[ptr:ptr + NPAYLOAD_BITS])
     ptr += NPAYLOAD_BITS
 
+    flags = bits_to_int(binary_bits[ptr:ptr + FRAME_FLAGS_BITS])
+    ptr += FRAME_FLAGS_BITS
+
     crc_rx = bits_to_int(binary_bits[ptr:ptr + CHECKSUM_BITS])
     ptr += CHECKSUM_BITS
 
@@ -319,8 +384,44 @@ def parse_common_header(binary_bits: list[int]):
         "n_total": n_total,
         "n_frame": n_frame,
         "n_payload": n_payload,
+        "flags": flags,
+        "is_last": bool(flags & FLAG_LAST_FRAME),
         "crc_rx": crc_rx,
     }
+
+
+def normalize_by_pilots(value: float, calibration: dict) -> float:
+    """AGC por software: normaliza intensidad usando pilotos extremos L0 y L3."""
+    lm = calibration["level_means"]
+    low = float(lm[0])
+    high = float(lm[3])
+
+    if abs(high - low) < 1e-6:
+        return 0.0
+
+    return float(np.clip((value - low) / (high - low), 0.0, 1.0))
+
+
+def is_calibration_valid(calibration: dict, rx_mode: str) -> tuple[bool, str]:
+    """
+    Guardia práctica contra cambios bruscos de iluminación, saturación severa
+    o capturas mezcladas por rolling shutter/transición de trama.
+    """
+    lm = calibration["level_means"]
+
+    if calibration["binary_contrast"] < MIN_BINARY_PILOT_CONTRAST:
+        return False, "contraste binario insuficiente"
+
+    if rx_mode == "ASK4_GRAY":
+        gaps = [lm[1] - lm[0], lm[2] - lm[1], lm[3] - lm[2]]
+
+        if not (lm[0] < lm[1] < lm[2] < lm[3]):
+            return False, "niveles ASK4 desordenados"
+
+        if min(gaps) < MIN_ASK4_LEVEL_GAP:
+            return False, "niveles ASK4 muy cercanos"
+
+    return True, "OK"
 
 
 def ask4_decode_from_means(payload_means: list[float], n_bits: int, calibration: dict) -> list[int]:
@@ -348,9 +449,17 @@ def ask4_decode_from_means(payload_means: list[float], n_bits: int, calibration:
 
         value = float(np.median(group))
 
+        # Decisor 4ASK con AGC: tanto el símbolo como los pilotos se
+        # comparan en escala normalizada para compensar ganancia/offset.
+        value_norm = normalize_by_pilots(value, calibration)
+        level_norm = {
+            level: normalize_by_pilots(level_means[level], calibration)
+            for level in [0, 1, 2, 3]
+        }
+
         nearest_level = min(
             [0, 1, 2, 3],
-            key=lambda level: abs(value - level_means[level])
+            key=lambda level: abs(value_norm - level_norm[level])
         )
 
         decoded.extend(list(level_to_bits[nearest_level]))
@@ -465,6 +574,10 @@ _debug_saved = False
 
 
 def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> float:
+    """
+    Muestreo robusto del macropíxel: se toma solo el centro de la celda
+    y se aplica estadística robusta para reducir reflejos, bordes y blur.
+    """
     r_cell = row + border
     c_cell = col + border
 
@@ -473,8 +586,8 @@ def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> 
     c0 = int(c_cell * cell_px)
     c1 = int((c_cell + 1) * cell_px)
 
-    margin_r = max(1, (r1 - r0) // 5)
-    margin_c = max(1, (c1 - c0) // 5)
+    margin_r = max(1, int((r1 - r0) * CELL_CENTER_MARGIN_FRACTION))
+    margin_c = max(1, int((c1 - c0) * CELL_CENTER_MARGIN_FRACTION))
 
     patch = gray_img[
         r0 + margin_r:r1 - margin_r,
@@ -484,7 +597,19 @@ def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> 
     if patch.size == 0:
         return 0.0
 
-    return float(patch.mean())
+    values = patch.astype(np.float32).ravel()
+
+    if CELL_STATISTIC == "MEDIAN":
+        return float(np.median(values))
+
+    if CELL_STATISTIC == "TRIMMED_MEAN" and values.size >= 10:
+        lo = np.percentile(values, 10)
+        hi = np.percentile(values, 90)
+        trimmed = values[(values >= lo) & (values <= hi)]
+        if trimmed.size > 0:
+            return float(trimmed.mean())
+
+    return float(values.mean())
 
 
 def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0):
@@ -532,8 +657,134 @@ def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0)
     }
 
 
+def decode_rolling_sync_bits(bits: list[int]) -> Optional[dict]:
+    if len(bits) != ROLLING_SYNC_BITS:
+        return None
+
+    ptr = 0
+
+    marker_value = bits_to_int(bits[ptr:ptr + ROLLING_SYNC_MARKER_BITS])
+    ptr += ROLLING_SYNC_MARKER_BITS
+
+    n_frame_mod = bits_to_int(bits[ptr:ptr + ROLLING_SYNC_FRAME_BITS])
+    ptr += ROLLING_SYNC_FRAME_BITS
+
+    n_total_mod = bits_to_int(bits[ptr:ptr + ROLLING_SYNC_TOTAL_BITS])
+    ptr += ROLLING_SYNC_TOTAL_BITS
+
+    if marker_value != ROLLING_SYNC_MARKER:
+        return None
+
+    return {
+        "n_frame_mod": n_frame_mod,
+        "n_total_mod": n_total_mod,
+    }
+
+
+def read_rolling_sync_bands(warp_gray, cell_px: float, binary_threshold: float, border: int = 0) -> dict:
+    """
+    Lee tres bandas temporales ubicadas a diferentes alturas de la grilla.
+    Si la cámara captura una mezcla por rolling shutter, es frecuente que
+    TOP/MID/BOT correspondan a números de trama distintos.
+    """
+    bands = {}
+    valid = []
+
+    if not ENABLE_ROLLING_SHUTTER_BAND_GUARD:
+        return {
+            "enabled": False,
+            "bands": {},
+            "valid": [],
+            "summary": "desactivado",
+        }
+
+    for name, positions in ROLLING_SYNC_BANDS.items():
+        bits = []
+        means = []
+
+        for row, col in positions:
+            mean_val = cell_mean(warp_gray, row, col, cell_px, border)
+            means.append(mean_val)
+            bits.append(1 if mean_val >= binary_threshold else 0)
+
+        decoded = decode_rolling_sync_bits(bits)
+        band_info = {
+            "name": name,
+            "bits": bits,
+            "means": means,
+            "valid": decoded is not None,
+            "n_frame_mod": None,
+            "n_total_mod": None,
+        }
+
+        if decoded is not None:
+            band_info.update(decoded)
+            valid.append(band_info)
+
+        bands[name] = band_info
+
+    if valid:
+        summary = ", ".join(
+            f"{b['name']}={b['n_frame_mod'] + 1}/{b['n_total_mod']}"
+            for b in valid
+        )
+    else:
+        summary = "sin bandas válidas"
+
+    return {
+        "enabled": True,
+        "bands": bands,
+        "valid": valid,
+        "summary": summary,
+    }
+
+
+def rolling_shutter_band_guard(sync_info: dict, parsed: dict) -> tuple[bool, str]:
+    """
+    Verifica consistencia temporal entre bandas superior/media/inferior.
+    - Si al menos dos bandas válidas dicen tramas diferentes, se descarta.
+    - Si al menos dos bandas válidas coinciden entre sí pero no con la cabecera, se descarta.
+    - Si hay menos de dos bandas válidas, no se descarta para evitar falsos negativos.
+    """
+    if not ENABLE_ROLLING_SHUTTER_BAND_GUARD:
+        return True, "desactivado"
+
+    valid = sync_info.get("valid", [])
+
+    if len(valid) < 2:
+        return True, "sin evidencia suficiente"
+
+    band_keys = [
+        (b["n_frame_mod"], b["n_total_mod"])
+        for b in valid
+    ]
+
+    if len(set(band_keys)) > 1:
+        detail = ", ".join(
+            f"{b['name']}={b['n_frame_mod'] + 1}/{b['n_total_mod']}"
+            for b in valid
+        )
+        return False, f"bandas temporales inconsistentes ({detail})"
+
+    band_frame_mod, band_total_mod = band_keys[0]
+    header_frame_mod = parsed["n_frame"] & 0x0F
+    header_total_mod = parsed["n_total"] & 0x0F
+
+    if band_frame_mod != header_frame_mod or band_total_mod != header_total_mod:
+        return False, (
+            "bandas no coinciden con cabecera "
+            f"(bandas={band_frame_mod + 1}/{band_total_mod}, "
+            f"cabecera={parsed['n_frame'] + 1}/{parsed['n_total']})"
+        )
+
+    return True, "bandas temporales consistentes"
+
+
 def read_symbol_cells(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
     global _debug_saved
+
+    if ENABLE_MEDIAN_SPATIAL_FILTER:
+        warp_gray = cv2.medianBlur(warp_gray, 3)
 
     H, W = warp_gray.shape
     cell_px = H / symbol_size
@@ -706,10 +957,16 @@ class Rx:
             "OOK_MANCHESTER": 0,
             "ASK4_GRAY": 0,
         }
+        self._calibration_reject_count = 0
+        self._last_calibration_reject_reason = ""
+        self._rolling_shutter_reject_count = 0
+        self._rolling_sync_consistent_count = 0
+        self._last_rolling_reject_reason = ""
 
         self._last_event_msg = ""
         self._last_calibration = None
         self._last_detected_modulation = None
+        self._last_rolling_sync = None
 
         self._reset_time = time.time()
         self._first_ok_time = None
@@ -750,6 +1007,14 @@ class Rx:
         self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
         self.cap.set(cv2.CAP_PROP_FOCUS, 0)
 
+        # Si la cámara lo soporta, se congela balance de blancos para reducir
+        # deriva lenta de brillo/color. Si no lo soporta, OpenCV simplemente ignora.
+        try:
+            self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+            self.cap.set(cv2.CAP_PROP_WB_TEMPERATURE, 4500)
+        except Exception:
+            pass
+
         for _ in range(5):
             self.cap.read()
 
@@ -763,6 +1028,7 @@ class Rx:
         print(f"Warp size:  {self.warp_size}x{self.warp_size}")
         print(f"Scale:      {self.scale}")
         print(f"Modo RX:    {self.modulation}")
+        print(f"Enlace:     {COMMUNICATION_MODE}")
         print(f"Estabilidad requerida: {self._required_stable}")
 
         if self.modulation == "OOK_MANCHESTER":
@@ -832,12 +1098,34 @@ class Rx:
             print(f"Tramas válidas recibidas: {len(self._frame_store)}/{self._n_total_expected}")
 
         total_crc_errors = sum(self._crc_error_counts.values())
-        if self._invalid_header_count or total_crc_errors:
+        if (
+            self._invalid_header_count or
+            total_crc_errors or
+            self._calibration_reject_count or
+            self._rolling_shutter_reject_count
+        ):
             print("\nTramas descartadas:")
             print(f"  Cabecera/preámbulo inválido: {self._invalid_header_count}")
+            if self._calibration_reject_count:
+                print(
+                    f"  Guardia de calibración/AGC: {self._calibration_reject_count} "
+                    f"({self._last_calibration_reject_reason})"
+                )
+            if self._rolling_shutter_reject_count:
+                print(
+                    f"  Rolling shutter detectado por bandas: {self._rolling_shutter_reject_count} "
+                    f"({self._last_rolling_reject_reason})"
+                )
             for mod_name, count in self._crc_error_counts.items():
                 if count:
                     print(f"  CRC error {mod_name}: {count}")
+
+        if self._last_rolling_sync is not None and ENABLE_ROLLING_SHUTTER_BAND_GUARD:
+            valid_count = len(self._last_rolling_sync.get("valid", []))
+            print("\nSincronización temporal / rolling shutter:")
+            print("  Detector por bandas: TOP/MID/BOT con marcador + número de trama")
+            print(f"  Última lectura válida: {valid_count}/3 bandas")
+            print(f"  Estado bandas: {self._last_rolling_sync.get('summary', '')}")
 
         if self._last_calibration is not None:
             c = self._last_calibration
@@ -1003,7 +1291,27 @@ class Rx:
         cell_means, binary_bits, calibration = read_symbol_cells(warp_gray, border=0)
         self._last_calibration = calibration
 
-        # Firma simple para estabilidad.
+        cell_px = warp_gray.shape[0] / SYMBOL_SIZE
+        rolling_sync = read_rolling_sync_bands(
+            warp_gray,
+            cell_px,
+            calibration["binary_threshold"],
+            border=0
+        )
+        self._last_rolling_sync = rolling_sync
+
+        if ENABLE_CALIBRATION_GUARD:
+            guard_mode = self.modulation if self.modulation != "AUTO" else "OOK_MANCHESTER"
+            ok_cal, reason = is_calibration_valid(calibration, guard_mode)
+            if not ok_cal:
+                self._calibration_reject_count += 1
+                self._last_calibration_reject_reason = reason
+                self._last_event_msg = f"[FRAME descartado] guardia calibración/rolling shutter: {reason}"
+                self._draw_hud(debug, fid_count=4, just_processed=False)
+                warp_vis = self._draw_grid(warp.copy(), ws)
+                return debug, warp_vis, self._decoded_text
+
+        # Firma simple para estabilidad temporal. Mitiga capturas repetidas o mezcladas.
         signature = tuple(int(v // 8) for v in cell_means[:200])
 
         if self._last_symbol_signature is None:
@@ -1033,69 +1341,86 @@ class Rx:
                 if PRINT_INVALID_FRAMES:
                     print(msg)
 
-            elif not parsed["crc_ok"]:
-                nf = parsed["n_frame"]
-                nt = parsed["n_total"]
-                mod = parsed["modulation"]
-                self._crc_error_counts[mod] = self._crc_error_counts.get(mod, 0) + 1
-
-                msg = f"[{mod}] [FRAME #{nf + 1}/{nt} DESCARTADO] CRC error"
-                self._last_event_msg = msg
-
-                if PRINT_CRC_ERRORS:
-                    print(msg)
-
             else:
-                nf = parsed["n_frame"]
-                nt = parsed["n_total"]
-                mod = parsed["modulation"]
+                ok_roll, roll_reason = rolling_shutter_band_guard(rolling_sync, parsed)
 
-                frame_key = (
-                    mod,
-                    nf,
-                    nt,
-                    parsed["n_payload"],
-                    parsed["crc_rx"],
-                )
+                if not ok_roll:
+                    self._rolling_shutter_reject_count += 1
+                    self._last_rolling_reject_reason = roll_reason
+                    self._last_event_msg = f"[FRAME descartado] rolling shutter: {roll_reason}"
 
-                if frame_key not in self._processed_frame_keys:
-                    self._processed_frame_keys.add(frame_key)
+                    if PRINT_INVALID_FRAMES:
+                        print(self._last_event_msg)
 
-                    if self._first_ok_time is None:
-                        self._first_ok_time = time.time()
+                    self._draw_hud(debug, fid_count=4, just_processed=False)
+                    warp_vis = self._draw_grid(warp.copy(), ws)
+                    return debug, warp_vis, self._decoded_text
 
-                    self._last_detected_modulation = mod
-                    self._n_total_expected = nt
-                    self._frame_store[nf] = parsed["payload"]
+                self._rolling_sync_consistent_count += 1
 
-                    self._try_reconstruct()
+                if not parsed["crc_ok"]:
+                    nf = parsed["n_frame"]
+                    nt = parsed["n_total"]
+                    mod = parsed["modulation"]
+                    self._crc_error_counts[mod] = self._crc_error_counts.get(mod, 0) + 1
 
-                    msg = (
-                        f"[{mod}] [FRAME #{nf + 1}/{nt} OK] "
-                        f"CRC ✓ | payload={parsed['n_payload']} bits | "
-                        f"almacenados={len(self._frame_store)}/{nt} | "
-                        f"texto={len(self._decoded_text)} chars"
+                    msg = f"[{mod}] [FRAME #{nf + 1}/{nt} DESCARTADO] CRC error"
+                    self._last_event_msg = msg
+
+                    if PRINT_CRC_ERRORS:
+                        print(msg)
+
+                else:
+                    nf = parsed["n_frame"]
+                    nt = parsed["n_total"]
+                    mod = parsed["modulation"]
+
+                    frame_key = (
+                        mod,
+                        nf,
+                        nt,
+                        parsed["n_payload"],
+                        parsed["crc_rx"],
                     )
 
-                    if self._complete_time is not None:
-                        tiempo_total, tiempo_desde_primer_ok = self._time_metrics()
+                    if frame_key not in self._processed_frame_keys:
+                        self._processed_frame_keys.add(frame_key)
 
-                        if tiempo_total is not None:
-                            msg += f" | tiempo_total_desde_reset={tiempo_total:.2f}s"
+                        if self._first_ok_time is None:
+                            self._first_ok_time = time.time()
 
-                        if tiempo_desde_primer_ok is not None:
-                            msg += f" | tiempo_desde_primer_frame_ok={tiempo_desde_primer_ok:.2f}s"
+                        self._last_detected_modulation = mod
+                        self._n_total_expected = nt
+                        self._frame_store[nf] = parsed["payload"]
 
-                        if self._ber_metrics is not None:
-                            msg += (
-                                f" | BER={self._ber_metrics['ber']:.2e} "
-                                f"| errores_bit={self._ber_metrics['bit_errors']}"
-                            )
+                        self._try_reconstruct()
 
-                    print(msg)
+                        msg = (
+                            f"[{mod}] [FRAME #{nf + 1}/{nt} OK] "
+                            f"CRC ✓ | payload={parsed['n_payload']} bits | "
+                            f"almacenados={len(self._frame_store)}/{nt} | "
+                            f"texto={len(self._decoded_text)} chars"
+                        )
 
-                    self._last_event_msg = msg
-                    symbol_just_processed = True
+                        if self._complete_time is not None:
+                            tiempo_total, tiempo_desde_primer_ok = self._time_metrics()
+
+                            if tiempo_total is not None:
+                                msg += f" | tiempo_total_desde_reset={tiempo_total:.2f}s"
+
+                            if tiempo_desde_primer_ok is not None:
+                                msg += f" | tiempo_desde_primer_frame_ok={tiempo_desde_primer_ok:.2f}s"
+
+                            if self._ber_metrics is not None:
+                                msg += (
+                                    f" | BER={self._ber_metrics['ber']:.2e} "
+                                    f"| errores_bit={self._ber_metrics['bit_errors']}"
+                                )
+
+                        print(msg)
+
+                        self._last_event_msg = msg
+                        symbol_just_processed = True
 
         self._draw_hud(debug, fid_count=4, just_processed=symbol_just_processed)
         warp_vis = self._draw_grid(warp.copy(), ws)
@@ -1148,6 +1473,13 @@ class Rx:
                 color,
                 2
             )
+
+        if self._last_rolling_sync is not None and ENABLE_ROLLING_SHUTTER_BAND_GUARD:
+            valid_count = len(self._last_rolling_sync.get("valid", []))
+            print("\nSincronización temporal / rolling shutter:")
+            print("  Detector por bandas: TOP/MID/BOT con marcador + número de trama")
+            print(f"  Última lectura válida: {valid_count}/3 bandas")
+            print(f"  Estado bandas: {self._last_rolling_sync.get('summary', '')}")
 
         if self._last_calibration is not None:
             c = self._last_calibration
@@ -1248,6 +1580,16 @@ class Rx:
                 c1 = int((col + 1) * cell_px)
                 cv2.rectangle(overlay, (c0, r0), (c1, r1), color, -1)
 
+        # Bandas temporales rolling shutter en magenta
+        if ENABLE_ROLLING_SHUTTER_BAND_GUARD:
+            for positions in ROLLING_SYNC_BANDS.values():
+                for row, col in positions:
+                    r0 = int(row * cell_px)
+                    c0 = int(col * cell_px)
+                    r1 = int((row + 1) * cell_px)
+                    c1 = int((col + 1) * cell_px)
+                    cv2.rectangle(overlay, (c0, r0), (c1, r1), (255, 0, 255), -1)
+
         cv2.addWeighted(overlay, 0.12, img, 0.88, 0, img)
 
         return img
@@ -1256,6 +1598,7 @@ class Rx:
 # ─────────────────────────── MAIN LOOP ───────────────────────────────────────
 if __name__ == "__main__":
     rx_mode = get_rx_modulation_from_args(RX_MODULATION)
+    EXPECTED_TEXT = load_expected_text_from_args(EXPECTED_TEXT)
 
     rx = Rx(scale=PROCESS_SCALE, warp_size=WARP_SIZE, modulation=rx_mode)
     rx.open_camera(cam_id=0)
@@ -1265,6 +1608,10 @@ if __name__ == "__main__":
     print("=" * 70)
     print("RX - MODEM OPTICO")
     print(f"Demodulador activo: {rx_mode}")
+    print(f"Modo de enlace: {COMMUNICATION_MODE}")
+    print("Sincronización: preámbulo + secuencia + flag fin + CRC")
+    print("Mitigación rolling shutter: guardia temporal/calibración + descarte CRC")
+    print("Muestreo: centro de macropíxel + filtro espacial/estadística robusta")
     print("Comandos: 'q' salir | 'r' reiniciar medición")
     print("Para pruebas formales usa modo forzado:")
     print("  python rx.py OOK_MANCHESTER")

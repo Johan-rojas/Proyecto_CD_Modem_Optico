@@ -33,9 +33,17 @@ SAVE_FIRST_FRAME_PNG = False
 SAVE_MODULATION_EXAMPLES = False
 RUN_DIGITAL_LOOPBACK_TEST = False
 
+# Modo de operación declarado para la sustentación.
+COMMUNICATION_MODE = "HALF_DUPLEX"
+
 # Repetición espacial para 4ASK:
 # cada símbolo 4ASK, que representa 2 bits, se dibuja en 3 celdas consecutivas.
 ASK4_REPEAT = 3
+
+# Referencias temporales para detectar rolling shutter en el RX.
+# Se escriben tres bandas binarias en alturas diferentes de la grilla
+# con marcador + número de trama + total de tramas.
+ENABLE_ROLLING_SYNC_BANDS = True
 
 
 # ─────────────────────────── TEXTO DE PRUEBA ─────────────────────────────────
@@ -145,6 +153,23 @@ def get_modulation_from_args(default: str) -> str:
     return default
 
 
+def load_text_from_args(default_text: str) -> str:
+    """
+    Permite transmitir un archivo .txt externo:
+        python tx_final.py OOK_MANCHESTER mensaje.txt
+        python tx_final.py ASK4_GRAY mensaje.txt
+    Si no se pasa archivo, usa DEMO_TEXT.
+    """
+    if len(sys.argv) >= 3:
+        path = sys.argv[2]
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        # Quitamos saltos redundantes del final, pero respetamos el contenido interno.
+        return text.strip()
+
+    return default_text
+
+
 def tx_delay_for_modulation(modulation: str) -> float:
     if modulation == "ASK4_GRAY":
         return TX_DELAY_ASK4
@@ -159,13 +184,18 @@ class Tx:
     NTOTAL_BITS = 16
     NFRAME_BITS = 16
     NPAYLOAD_BITS = 16
+    FRAME_FLAGS_BITS = 8
     CHECKSUM_BITS = 16
+
+    # Bit 0 = última trama del mensaje. Funciona como delimitador explícito de fin.
+    FLAG_LAST_FRAME = 0x01
 
     HEADER_BITS = (
         PREAMBLE_BITS +
         NTOTAL_BITS +
         NFRAME_BITS +
         NPAYLOAD_BITS +
+        FRAME_FLAGS_BITS +
         CHECKSUM_BITS
     )
 
@@ -198,6 +228,25 @@ class Tx:
             (8, 31), (31, 8),
             (29, 20), (20, 29),
         ],
+    }
+
+    # Bandas temporales binarias para detección explícita de rolling shutter.
+    # Cada banda codifica 12 bits:
+    #   4 bits marcador 1010 + 4 bits número de trama + 4 bits total de tramas.
+    # Se ubican a tres alturas: superior, media e inferior.
+    ROLLING_SYNC_MARKER = 0b1010
+    ROLLING_SYNC_MARKER_BITS = 4
+    ROLLING_SYNC_FRAME_BITS = 4
+    ROLLING_SYNC_TOTAL_BITS = 4
+    ROLLING_SYNC_BITS = (
+        ROLLING_SYNC_MARKER_BITS +
+        ROLLING_SYNC_FRAME_BITS +
+        ROLLING_SYNC_TOTAL_BITS
+    )
+    ROLLING_SYNC_BANDS = {
+        "TOP": [(9, c) for c in range(12, 24)],
+        "MID": [(19, c) for c in range(12, 24)],
+        "BOT": [(30, c) for c in range(12, 24)],
     }
 
     # Niveles físicos para ASK4.
@@ -295,6 +344,43 @@ class Tx:
 
         return positions
 
+    def _all_rolling_sync_positions(self) -> list[tuple[int, int]]:
+        positions = []
+
+        if ENABLE_ROLLING_SYNC_BANDS:
+            for pts in self.ROLLING_SYNC_BANDS.values():
+                positions.extend(pts)
+
+        return positions
+
+    def _build_rolling_sync_bits(self, n_total: int, n_frame: int) -> list[int]:
+        """
+        Referencia temporal compacta para tres alturas de la grilla.
+        Usa valores módulo 16 porque el proyecto trabaja con pocas tramas
+        para 500 caracteres.
+        """
+        return (
+            self._int_to_bits(self.ROLLING_SYNC_MARKER, self.ROLLING_SYNC_MARKER_BITS) +
+            self._int_to_bits(n_frame & 0x0F, self.ROLLING_SYNC_FRAME_BITS) +
+            self._int_to_bits(n_total & 0x0F, self.ROLLING_SYNC_TOTAL_BITS)
+        )
+
+    def _draw_rolling_sync_bands(self, symbol: np.ndarray, n_total: int, n_frame: int) -> None:
+        if not ENABLE_ROLLING_SYNC_BANDS:
+            return
+
+        bits = self._build_rolling_sync_bits(n_total, n_frame)
+
+        for positions in self.ROLLING_SYNC_BANDS.values():
+            if len(positions) != len(bits):
+                raise ValueError(
+                    "Cada banda rolling sync debe tener exactamente "
+                    f"{len(bits)} posiciones."
+                )
+
+            for (r, c), bit in zip(positions, bits):
+                symbol[r, c] = float(bit)
+
     def _build_reserved_mask(self) -> np.ndarray:
         N = self.symbol_size
         FQ = self.FID_SIZE + self.QUIET
@@ -314,6 +400,12 @@ class Tx:
         for r, c in self._all_pilot_positions():
             if not (0 <= r < N and 0 <= c < N):
                 raise ValueError(f"Piloto fuera de la grilla: {(r, c)}")
+            mask[r, c] = True
+
+        # Bandas temporales para detección de rolling shutter
+        for r, c in self._all_rolling_sync_positions():
+            if not (0 <= r < N and 0 <= c < N):
+                raise ValueError(f"Celda rolling sync fuera de la grilla: {(r, c)}")
             mask[r, c] = True
 
         return mask
@@ -461,12 +553,13 @@ class Tx:
 
         self._gen_img()
 
-    def _build_header(self, n_total: int, idx: int, n_real: int, crc: int) -> list[int]:
+    def _build_header(self, n_total: int, idx: int, n_real: int, flags: int, crc: int) -> list[int]:
         return (
             self._int_to_bits(self.PREAMBLE, self.PREAMBLE_BITS) +
             self._int_to_bits(n_total, self.NTOTAL_BITS) +
             self._int_to_bits(idx, self.NFRAME_BITS) +
             self._int_to_bits(n_real, self.NPAYLOAD_BITS) +
+            self._int_to_bits(flags, self.FRAME_FLAGS_BITS) +
             self._int_to_bits(crc, self.CHECKSUM_BITS)
         )
 
@@ -487,9 +580,10 @@ class Tx:
 
         for idx, real_bits in enumerate(chunks):
             n_real = len(real_bits)
+            flags = self.FLAG_LAST_FRAME if idx == n_total - 1 else 0
             crc = crc16(real_bits)
 
-            header_cells = self._build_header(n_total, idx, n_real, crc)
+            header_cells = self._build_header(n_total, idx, n_real, flags, crc)
 
             if self.modulation == "OOK_MANCHESTER":
                 payload_cells = self._manchester_encode(real_bits)
@@ -534,7 +628,7 @@ class Tx:
 
         imgs = []
 
-        for frame_cells in frames:
+        for idx, frame_cells in enumerate(frames):
             symbol = np.ones((N, N), dtype=float)
 
             for (r, c), value in zip(self._data_positions, frame_cells):
@@ -542,6 +636,7 @@ class Tx:
 
             self._draw_fiducials(symbol)
             self._draw_pilots(symbol)
+            self._draw_rolling_sync_bands(symbol, len(frames), idx)
 
             bordered = np.ones((N + 2 * B, N + 2 * B), dtype=float)
             bordered[B:B + N, B:B + N] = symbol
@@ -577,6 +672,9 @@ class Tx:
 
             n_payload = bits_to_int(raw_bits[ptr:ptr + self.NPAYLOAD_BITS])
             ptr += self.NPAYLOAD_BITS
+
+            flags = bits_to_int(raw_bits[ptr:ptr + self.FRAME_FLAGS_BITS])
+            ptr += self.FRAME_FLAGS_BITS
 
             crc_rx = bits_to_int(raw_bits[ptr:ptr + self.CHECKSUM_BITS])
             ptr += self.CHECKSUM_BITS
@@ -721,6 +819,7 @@ class Tx:
 
         print("\nTX en ejecución.")
         print("Presiona 'q' sobre la ventana del TX para detener.")
+        print(f"Modo de enlace: {COMMUNICATION_MODE}")
         print(f"Modulación activa: {self.modulation}")
         print(f"Delay por trama: {delay:.3f} s")
         print(f"Tramas por ciclo: {n}")
@@ -783,13 +882,19 @@ class Tx:
         print(f"Fiduciales: 4 patrones de {self.FID_SIZE}×{self.FID_SIZE}")
         print(f"Quiet zone por fiducial: {self.QUIET}")
         print(f"Pilotos por nivel: 4 niveles × 4 pilotos = 16 pilotos")
+        if ENABLE_ROLLING_SYNC_BANDS:
+            print(
+                "Bandas temporales rolling shutter: "
+                "3 bandas × 12 bits = 36 celdas reservadas"
+            )
         print(f"Celdas reservadas totales: {int(self._reserved_mask.sum())}")
         print(f"Celdas de datos disponibles: {nd}")
         print(f"Cabecera: {hc} celdas")
         print(
             "  preámbulo 16b + N_total 16b + N_frame 16b "
-            "+ N_payload 16b + CRC-16 16b"
+            "+ N_payload 16b + FLAGS 8b + CRC-16 16b"
         )
+        print("  FLAGS: bit0=última trama / delimitador explícito de fin de mensaje")
 
         if self.modulation == "OOK_MANCHESTER":
             print(f"Payload Manchester: {pc} celdas → {pb} bits útiles/frame")
@@ -835,19 +940,21 @@ def save_modulation_examples(texto: str) -> None:
 # ─────────────────────────────── MAIN ────────────────────────────────────────
 if __name__ == "__main__":
     modulation = get_modulation_from_args(MODULATION)
+    tx_text = load_text_from_args(DEMO_TEXT)
 
     print("=" * 70)
     print("TX - MODEM OPTICO")
     print(f"Modulación seleccionada: {modulation}")
+    print(f"Texto a transmitir: {len(tx_text)} caracteres")
     print("=" * 70)
 
     if SAVE_MODULATION_EXAMPLES:
-        save_modulation_examples(DEMO_TEXT)
+        save_modulation_examples(tx_text)
 
     if RUN_DIGITAL_LOOPBACK_TEST:
         print("Prueba interna OOK_MANCHESTER")
         tx_test_ook = Tx(symbol_size=SYMBOL_SIZE, modulation="OOK_MANCHESTER")
-        tx_test_ook.encode(DEMO_TEXT)
+        tx_test_ook.encode(tx_text)
         tx_test_ook.print_loopback_report()
 
         print("Prueba interna ASK4_GRAY")
@@ -856,7 +963,7 @@ if __name__ == "__main__":
             modulation="ASK4_GRAY",
             ask4_repeat=ASK4_REPEAT,
         )
-        tx_test_ask.encode(DEMO_TEXT)
+        tx_test_ask.encode(tx_text)
         tx_test_ask.print_loopback_report()
 
     tx = Tx(
@@ -865,7 +972,7 @@ if __name__ == "__main__":
         ask4_repeat=ASK4_REPEAT,
     )
 
-    tx.encode(DEMO_TEXT)
+    tx.encode(tx_text)
     tx.info()
     tx.print_loopback_report()
 
