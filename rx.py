@@ -24,11 +24,9 @@ CAMERA_FPS = 30
 WARP_SIZE = 800
 
 # Escala de procesamiento.
-# Con 0.5 ya se logró decodificación rápida y estable.
 PROCESS_SCALE = 0.5
 
 # Estabilidad temporal.
-# 1 = procesa una lectura apenas aparece.
 REQUIRED_STABLE = 1
 
 # Debug / consola
@@ -37,10 +35,9 @@ PRINT_INVALID_FRAMES = False
 PRINT_CRC_ERRORS = True
 SAVE_DEBUG_IMAGE = True
 
-# Activar cálculo de BER contra texto de referencia conocido.
+# BER contra texto esperado
 ENABLE_BER_EVALUATION = True
 
-# Texto esperado. Debe ser exactamente el mismo texto que transmite tx_final.py.
 EXPECTED_TEXT = (
     "La vision artificial permite interpretar imagenes mediante algoritmos "
     "que detectan patrones, formas y relaciones espaciales. Los sistemas "
@@ -50,6 +47,24 @@ EXPECTED_TEXT = (
     "escala y posicion, facilitando la reconstruccion proyectiva y la extraccion "
     "robusta de informacion contenida dentro de una region determinada."
 )
+
+# Pilotos explícitos: deben coincidir exactamente con tx_final.py
+PILOT_BLACK_POSITIONS = [
+    (8, 8), (8, 31),
+    (31, 8), (31, 31),
+    (10, 20), (29, 20),
+    (20, 10), (20, 29),
+]
+
+PILOT_WHITE_POSITIONS = [
+    (8, 9), (8, 30),
+    (31, 9), (31, 30),
+    (11, 20), (28, 20),
+    (20, 11), (20, 28),
+]
+
+USE_PILOT_THRESHOLD = True
+MIN_PILOT_CONTRAST = 20.0
 
 # Cabecera, igual que Tx
 PREAMBLE = 0xDEAD
@@ -64,10 +79,28 @@ HEADER_BITS = PREAMBLE_BITS + NTOTAL_BITS + NFRAME_BITS + NPAYLOAD_BITS + CHECKS
 MAX_TOTAL_FRAMES = 100
 
 
+# ─────────────────────────── MÁSCARAS ESPACIALES ─────────────────────────────
 def build_reserved_mask(N=SYMBOL_SIZE, FQ=FQ):
+    """
+    Reserva:
+      - fiduciales + quiet zone
+      - pilotos explícitos negro/blanco
+    """
     mask = np.zeros((N, N), dtype=bool)
-    for r0, c0 in [(0, 0), (0, N - FQ), (N - FQ, 0), (N - FQ, N - FQ)]:
+
+    for r0, c0 in [
+        (0, 0),
+        (0, N - FQ),
+        (N - FQ, 0),
+        (N - FQ, N - FQ),
+    ]:
         mask[r0:r0 + FQ, c0:c0 + FQ] = True
+
+    for r, c in PILOT_BLACK_POSITIONS + PILOT_WHITE_POSITIONS:
+        if not (0 <= r < N and 0 <= c < N):
+            raise ValueError(f"Piloto fuera de la grilla: {(r, c)}")
+        mask[r, c] = True
+
     return mask
 
 
@@ -168,12 +201,6 @@ def bits_to_text(bits: list) -> str:
 
 
 def compute_ber(expected_bits: list[int], received_bits: list[int]) -> dict:
-    """
-    Calcula BER comparando bits esperados contra bits recibidos.
-
-    Si las longitudes son diferentes, los bits faltantes o sobrantes
-    se cuentan como errores. Esto permite reportar BER de forma conservadora.
-    """
     max_len = max(len(expected_bits), len(received_bits))
 
     if max_len == 0:
@@ -237,12 +264,9 @@ def parse_frame(all_bits: list):
     crc_rx = bits_to_int(all_bits[ptr:ptr + CHECKSUM_BITS])
     ptr += CHECKSUM_BITS
 
-    # Validar preámbulo
     if preamble != PREAMBLE:
         return None
 
-    # Validar cabecera para evitar casos absurdos:
-    # FRAME #8/7, FRAME #64/775, FRAME #7/32775, etc.
     if n_total <= 0 or n_total > MAX_TOTAL_FRAMES:
         return None
 
@@ -280,15 +304,81 @@ def parse_frame(all_bits: list):
     }
 
 
-# ─────────────────────────── LECTURA DE GRILLA ───────────────────────────────
+# ─────────────────────────── LECTURA DE GRILLA CON PILOTOS ───────────────────
 _debug_saved = False
+
+
+def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> float:
+    r_cell = row + border
+    c_cell = col + border
+
+    r0 = int(r_cell * cell_px)
+    r1 = int((r_cell + 1) * cell_px)
+    c0 = int(c_cell * cell_px)
+    c1 = int((c_cell + 1) * cell_px)
+
+    margin_r = max(1, (r1 - r0) // 5)
+    margin_c = max(1, (c1 - c0) // 5)
+
+    patch = gray_img[
+        r0 + margin_r:r1 - margin_r,
+        c0 + margin_c:c1 - margin_c
+    ]
+
+    if patch.size == 0:
+        return 0.0
+
+    return float(patch.mean())
+
+
+def estimate_threshold_with_pilots(warp_gray, cell_px: float, border: int = 0):
+    """
+    Calcula umbral con pilotos explícitos.
+    Fallback: Otsu si los pilotos no tienen suficiente contraste.
+    """
+    black_means = [
+        cell_mean(warp_gray, r, c, cell_px, border)
+        for r, c in PILOT_BLACK_POSITIONS
+    ]
+
+    white_means = [
+        cell_mean(warp_gray, r, c, cell_px, border)
+        for r, c in PILOT_WHITE_POSITIONS
+    ]
+
+    black_mean = float(np.mean(black_means)) if black_means else 0.0
+    white_mean = float(np.mean(white_means)) if white_means else 255.0
+    contrast = white_mean - black_mean
+
+    if USE_PILOT_THRESHOLD and contrast >= MIN_PILOT_CONTRAST:
+        threshold = (black_mean + white_mean) / 2.0
+        mode = "PILOT"
+    else:
+        otsu_threshold, _ = cv2.threshold(
+            warp_gray,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        threshold = float(otsu_threshold)
+        mode = "OTSU_FALLBACK"
+
+    return {
+        "threshold": threshold,
+        "mode": mode,
+        "black_mean": black_mean,
+        "white_mean": white_mean,
+        "contrast": contrast,
+    }
 
 
 def read_symbol_bits(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
     """
-    Lee la grilla rectificada y devuelve los bits de DATA_POSITIONS.
+    Lee la grilla rectificada y devuelve:
+      bits de DATA_POSITIONS
+      información de calibración
 
-    border=0 porque la homografía actual ya rectifica directamente el símbolo.
+    Ahora usa pilotos explícitos para estimar el umbral blanco/negro.
     """
     global _debug_saved
 
@@ -296,67 +386,72 @@ def read_symbol_bits(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
     total_cells = symbol_size
     cell_px = H / total_cells
 
-    _, bw = cv2.threshold(
-        warp_gray,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
+    calibration = estimate_threshold_with_pilots(warp_gray, cell_px, border)
+    threshold = calibration["threshold"]
+
+    bw = np.where(warp_gray >= threshold, 255, 0).astype(np.uint8)
 
     if SAVE_DEBUG_IMAGE and not _debug_saved:
         os.makedirs("debug_rx", exist_ok=True)
 
         debug_color = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
 
+        # Primera celda de datos
         first_row, first_col = DATA_POSITIONS[0]
-        rr = first_row + border
-        cc = first_col + border
+        for row, col, color in [
+            (first_row, first_col, (255, 0, 0)),
+        ]:
+            r0 = int((row + border) * cell_px)
+            r1 = int((row + border + 1) * cell_px)
+            c0 = int((col + border) * cell_px)
+            c1 = int((col + border + 1) * cell_px)
+            cv2.rectangle(debug_color, (c0, r0), (c1, r1), color, 2)
 
-        r0 = int(rr * cell_px)
-        r1 = int((rr + 1) * cell_px)
-        c0 = int(cc * cell_px)
-        c1 = int((cc + 1) * cell_px)
+        # Pilotos negros en rojo
+        for row, col in PILOT_BLACK_POSITIONS:
+            r0 = int((row + border) * cell_px)
+            r1 = int((row + border + 1) * cell_px)
+            c0 = int((col + border) * cell_px)
+            c1 = int((col + border + 1) * cell_px)
+            cv2.rectangle(debug_color, (c0, r0), (c1, r1), (0, 0, 255), 2)
 
-        cv2.rectangle(debug_color, (c0, r0), (c1, r1), (0, 0, 255), 2)
-        cv2.imwrite(os.path.join("debug_rx", "debug_bw.png"), debug_color)
+        # Pilotos blancos en verde
+        for row, col in PILOT_WHITE_POSITIONS:
+            r0 = int((row + border) * cell_px)
+            r1 = int((row + border + 1) * cell_px)
+            c0 = int((col + border) * cell_px)
+            c1 = int((col + border + 1) * cell_px)
+            cv2.rectangle(debug_color, (c0, r0), (c1, r1), (0, 255, 0), 2)
 
+        cv2.imwrite(os.path.join("debug_rx", "debug_bw_pilots.png"), debug_color)
         _debug_saved = True
 
     if DEBUG_VERBOSE:
         print(f"Primera posición de datos: {DATA_POSITIONS[0]}")
         print(f"cell_px: {cell_px:.2f}")
         print(f"total_cells: {total_cells}")
+        print(
+            f"Calibración: modo={calibration['mode']} "
+            f"threshold={calibration['threshold']:.1f} "
+            f"black={calibration['black_mean']:.1f} "
+            f"white={calibration['white_mean']:.1f} "
+            f"contrast={calibration['contrast']:.1f}"
+        )
 
     bits = []
 
     for i, (row, col) in enumerate(DATA_POSITIONS):
-        r_cell = row + border
-        c_cell = col + border
-
-        r0 = int(r_cell * cell_px)
-        r1 = int((r_cell + 1) * cell_px)
-        c0 = int(c_cell * cell_px)
-        c1 = int((c_cell + 1) * cell_px)
-
-        margin_r = max(1, (r1 - r0) // 5)
-        margin_c = max(1, (c1 - c0) // 5)
-
-        patch = bw[
-            r0 + margin_r:r1 - margin_r,
-            c0 + margin_c:c1 - margin_c
-        ]
-
-        mean_val = float(patch.mean()) if patch.size else 0.0
+        mean_val = cell_mean(warp_gray, row, col, cell_px, border)
 
         if DEBUG_VERBOSE and i == 0:
             print(
-                f"Celda ({row},{col}) -> r0={r0} r1={r1} "
-                f"c0={c0} c1={c1} -> mean={mean_val:.0f}"
+                f"Celda ({row},{col}) -> mean={mean_val:.0f} "
+                f"threshold={threshold:.1f}"
             )
 
-        bits.append(0 if mean_val < 128 else 1)
+        bits.append(1 if mean_val >= threshold else 0)
 
-    return bits
+    return bits, calibration
 
 
 # ─────────────────────────── DETECTOR DE FIDUCIALES ──────────────────────────
@@ -427,10 +522,6 @@ def detect_fiducials(binary, contours, hierarchy):
 
 
 def order_corners(fiducials):
-    """
-    Ordena los cuatro fiduciales como:
-      TL, TR, BR, BL
-    """
     centers = np.array([f["center"] for f in fiducials])
 
     s = centers.sum(axis=1)
@@ -455,11 +546,8 @@ class Rx:
         self.scale = scale
         self.warp_size = warp_size
         self.cap = None
-
-        # Inicializa estado sin imprimir todavía.
         self.reset(announce=False)
 
-    # ── Estado ────────────────────────────────────────────────────────────────
     def reset(self, announce=True):
         self._frame_store = {}
         self._n_total_expected = None
@@ -472,6 +560,7 @@ class Rx:
         self._processed_symbol_ids = set()
 
         self._last_event_msg = ""
+        self._last_calibration = None
 
         # Métricas de tiempo
         self._reset_time = time.time()
@@ -479,7 +568,7 @@ class Rx:
         self._complete_time = None
         self._final_reported = False
 
-        # Métricas de BER
+        # Métricas BER
         self._ber_metrics = None
         self._text_match = None
 
@@ -507,8 +596,6 @@ class Rx:
         for _ in range(10):
             self.cap.read()
 
-        # Estas propiedades dependen de cada cámara/driver.
-        # Si el driver las ignora, no pasa nada.
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
         self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)
         self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 113)
@@ -530,6 +617,7 @@ class Rx:
         print(f"Warp size:  {self.warp_size}x{self.warp_size}")
         print(f"Scale:      {self.scale}")
         print(f"Estabilidad requerida: {self._required_stable}")
+        print(f"Pilotos:    {len(PILOT_BLACK_POSITIONS)} negros + {len(PILOT_WHITE_POSITIONS)} blancos")
 
         if ENABLE_BER_EVALUATION:
             print("BER:        habilitado contra texto de referencia local")
@@ -582,6 +670,15 @@ class Rx:
         if tiempo_desde_primer_ok is not None:
             print(f"Tiempo desde primer FRAME OK: {tiempo_desde_primer_ok:.2f} s")
 
+        if self._last_calibration is not None:
+            c = self._last_calibration
+            print("\nCalibración por pilotos:")
+            print(f"  Modo umbral:          {c['mode']}")
+            print(f"  Pilotos negros media: {c['black_mean']:.2f}")
+            print(f"  Pilotos blancos media:{c['white_mean']:.2f}")
+            print(f"  Contraste pilotos:    {c['contrast']:.2f}")
+            print(f"  Umbral usado:         {c['threshold']:.2f}")
+
         if ENABLE_BER_EVALUATION and self._ber_metrics is not None:
             m = self._ber_metrics
             print("\nMétricas BER:")
@@ -597,7 +694,7 @@ class Rx:
         if tiempo_total is None:
             print("\nNo se completó la decodificación del texto.")
 
-    # ── Reconstrucción de texto ───────────────────────────────────────────────
+    # ── Reconstrucción ────────────────────────────────────────────────────────
     def _try_reconstruct(self):
         if self._n_total_expected is None:
             return
@@ -623,7 +720,6 @@ class Rx:
     def process_frame(self, frame):
         debug = frame.copy()
 
-        # Procesamos toda la imagen, pero a escala reducida.
         roi = frame
 
         scaled = cv2.resize(
@@ -708,7 +804,8 @@ class Rx:
         warp = cv2.warpPerspective(frame, M, (ws, ws))
 
         warp_gray = cv2.cvtColor(warp, cv2.COLOR_BGR2GRAY)
-        bits = read_symbol_bits(warp_gray, border=0)
+        bits, calibration = read_symbol_bits(warp_gray, border=0)
+        self._last_calibration = calibration
 
         # ── Estabilidad temporal ─────────────────────────────────────────────
         if self._last_symbol_bits is None:
@@ -761,8 +858,6 @@ class Rx:
                         self._first_ok_time = time.time()
 
                     self._n_total_expected = nt
-
-                    # Guardar la trama válida. Si llega repetida, se sobrescribe igual.
                     self._frame_store[nf] = parsed["payload"]
 
                     self._try_reconstruct()
@@ -845,11 +940,24 @@ class Rx:
                 2
             )
 
+        if self._last_calibration is not None:
+            c = self._last_calibration
+            cv2.putText(
+                debug,
+                f"Cal: {c['mode']} thr={c['threshold']:.0f} "
+                f"B={c['black_mean']:.0f} W={c['white_mean']:.0f}",
+                (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 0),
+                2
+            )
+
         if self._ber_metrics is not None:
             cv2.putText(
                 debug,
                 f"BER={self._ber_metrics['ber']:.2e} | errores={self._ber_metrics['bit_errors']}",
-                (10, 90),
+                (10, 120),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (0, 255, 255),
@@ -869,9 +977,6 @@ class Rx:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _best_four(self, fiducials):
-        """
-        Selecciona cuatro fiduciales extremos.
-        """
         centers = np.array([f["center"] for f in fiducials])
 
         s = centers.sum(axis=1)
@@ -896,9 +1001,6 @@ class Rx:
         return [fiducials[i] for i in unique[:4]]
 
     def _draw_grid(self, img, ws):
-        """
-        Dibuja la grilla visual sobre la imagen rectificada.
-        """
         total_cells = SYMBOL_SIZE
         cell_px = ws / total_cells
 
@@ -909,13 +1011,29 @@ class Rx:
 
         overlay = img.copy()
 
+        # Celdas de datos
         for row, col in DATA_POSITIONS:
             r0 = int(row * cell_px)
             c0 = int(col * cell_px)
             r1 = int((row + 1) * cell_px)
             c1 = int((col + 1) * cell_px)
-
             cv2.rectangle(overlay, (c0, r0), (c1, r1), (255, 100, 0), -1)
+
+        # Pilotos negros
+        for row, col in PILOT_BLACK_POSITIONS:
+            r0 = int(row * cell_px)
+            c0 = int(col * cell_px)
+            r1 = int((row + 1) * cell_px)
+            c1 = int((col + 1) * cell_px)
+            cv2.rectangle(overlay, (c0, r0), (c1, r1), (0, 0, 255), -1)
+
+        # Pilotos blancos
+        for row, col in PILOT_WHITE_POSITIONS:
+            r0 = int(row * cell_px)
+            c0 = int(col * cell_px)
+            r1 = int((row + 1) * cell_px)
+            c1 = int((col + 1) * cell_px)
+            cv2.rectangle(overlay, (c0, r0), (c1, r1), (0, 255, 0), -1)
 
         cv2.addWeighted(overlay, 0.12, img, 0.88, 0, img)
 
@@ -927,12 +1045,12 @@ if __name__ == "__main__":
     rx = Rx(scale=PROCESS_SCALE, warp_size=WARP_SIZE)
     rx.open_camera(cam_id=0)
 
-    # Este reset ocurre después de abrir cámara.
-    # Así el tiempo_total_desde_reset no incluye la inicialización de cámara.
+    # Reset después de abrir cámara.
     rx.reset()
 
     print("Leyendo... 'q' para salir, 'r' para reiniciar decoder.")
     print("Tip: presiona 'r' cuando ya tengas la cámara bien apuntada al TX.")
+    print("Tip: este RX requiere el TX actualizado con pilotos explícitos.")
     print("Tip: si no detecta cámara, cambia rx.open_camera(cam_id=0) por 1 o 2.")
     print("Tip: si hay muchos CRC error, mejora enfoque/brillo o sube delay en TX.")
     print("Tip: para medir formalmente, usa el mismo EXPECTED_TEXT que transmite tx_final.py.\n")
