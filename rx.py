@@ -43,14 +43,8 @@ REQUIRED_STABLE = 1
 DEBUG_VERBOSE = False
 PRINT_INVALID_FRAMES = False
 PRINT_CRC_ERRORS = False
-SAVE_DEBUG_IMAGE = False
+SAVE_DEBUG_IMAGE = True
 PRINT_FPS_EVERY_SECOND = False
-
-# Muestreo robusto del centro de cada celda.
-# Mantiene la version estable 40x40, pero reduce ruido de bordes/reflejos.
-CELL_CENTER_MARGIN_FRACTION = 0.22
-CELL_STATISTIC = "TRIMMED_MEAN"  # opciones: MEAN, MEDIAN, TRIMMED_MEAN
-COLOR_STATISTIC = "MEDIAN"      # opciones: MEAN, MEDIAN
 
 ENABLE_BER_EVALUATION = True
 
@@ -592,7 +586,7 @@ def parse_and_decode_frame(cell_means: list[float], color_means: list[np.ndarray
 _debug_saved = False
 
 
-def _center_patch(img, row: int, col: int, cell_px: float, border: int = 0):
+def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> float:
     r_cell = row + border
     c_cell = col + border
 
@@ -601,51 +595,43 @@ def _center_patch(img, row: int, col: int, cell_px: float, border: int = 0):
     c0 = int(c_cell * cell_px)
     c1 = int((c_cell + 1) * cell_px)
 
-    margin_r = max(1, int((r1 - r0) * CELL_CENTER_MARGIN_FRACTION))
-    margin_c = max(1, int((c1 - c0) * CELL_CENTER_MARGIN_FRACTION))
+    margin_r = max(1, (r1 - r0) // 5)
+    margin_c = max(1, (c1 - c0) // 5)
 
-    patch = img[
+    patch = gray_img[
         r0 + margin_r:r1 - margin_r,
         c0 + margin_c:c1 - margin_c
     ]
 
-    return patch
-
-
-def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> float:
-    patch = _center_patch(gray_img, row, col, cell_px, border)
-
     if patch.size == 0:
         return 0.0
 
-    values = patch.astype(np.float32).ravel()
+    return float(patch.mean())
 
-    if CELL_STATISTIC == "MEDIAN":
-        return float(np.median(values))
 
-    if CELL_STATISTIC == "TRIMMED_MEAN" and values.size >= 10:
-        lo = np.percentile(values, 10)
-        hi = np.percentile(values, 90)
-        trimmed = values[(values >= lo) & (values <= hi)]
-        if trimmed.size > 0:
-            return float(trimmed.mean())
-
-    return float(values.mean())
 
 
 def cell_color_mean(bgr_img, row: int, col: int, cell_px: float, border: int = 0) -> np.ndarray:
-    patch = _center_patch(bgr_img, row, col, cell_px, border)
+    r_cell = row + border
+    c_cell = col + border
+
+    r0 = int(r_cell * cell_px)
+    r1 = int((r_cell + 1) * cell_px)
+    c0 = int(c_cell * cell_px)
+    c1 = int((c_cell + 1) * cell_px)
+
+    margin_r = max(1, (r1 - r0) // 5)
+    margin_c = max(1, (c1 - c0) // 5)
+
+    patch = bgr_img[
+        r0 + margin_r:r1 - margin_r,
+        c0 + margin_c:c1 - margin_c
+    ]
 
     if patch.size == 0:
         return np.zeros(3, dtype=float)
 
-    values = patch.reshape(-1, 3).astype(np.float32)
-
-    if COLOR_STATISTIC == "MEDIAN":
-        return np.median(values, axis=0).astype(float)
-
-    return values.mean(axis=0).astype(float)
-
+    return patch.reshape(-1, 3).mean(axis=0).astype(float)
 
 def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0, warp_bgr=None):
     level_means = {}
@@ -932,15 +918,6 @@ class Rx:
         self.cap.set(cv2.CAP_PROP_GAIN, 34)
         self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
         self.cap.set(cv2.CAP_PROP_FOCUS, 0)
-
-        # Congela balance de blancos si la cámara lo soporta.
-        # Esto ayuda especialmente a CSK_RGB, porque evita que la cámara cambie
-        # la mezcla de colores durante la transmisión.
-        try:
-            self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-            self.cap.set(cv2.CAP_PROP_WB_TEMPERATURE, 4500)
-        except Exception:
-            pass
 
         for _ in range(5):
             self.cap.read()

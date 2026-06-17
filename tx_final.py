@@ -26,7 +26,7 @@ SYMBOL_SIZE = 40
 # Delay por modulación
 TX_DELAY_OOK = 0.10
 TX_DELAY_ASK4 = 0.10
-TX_DELAY_CSK = 0.15
+TX_DELAY_CSK = 0.10
 
 FULLSCREEN = True
 
