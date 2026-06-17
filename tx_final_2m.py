@@ -24,15 +24,15 @@ MODULATION = "OOK_MANCHESTER"
 SYMBOL_SIZE = 40
 
 # Delay por modulación
-TX_DELAY_OOK = 0.16
-TX_DELAY_ASK4 = 0.16
-TX_DELAY_CSK = 0.16
+TX_DELAY_OOK = 0.12
+TX_DELAY_ASK4 = 0.12
+TX_DELAY_CSK = 0.12
 
 FULLSCREEN = True
 
 # Perfil 2 m: se reduce ligeramente el brillo mostrado para evitar saturación
 # en cámara cuando la pantalla se ve muy brillante desde lejos.
-TX_DISPLAY_GAIN = 0.88
+TX_DISPLAY_GAIN = 0.85
 
 # Modo limpio para sustentación:
 # False evita salidas extra antes de abrir la ventana de transmisión.
@@ -42,11 +42,11 @@ RUN_DIGITAL_LOOPBACK_TEST = False
 
 # Repetición espacial para 4ASK:
 # cada símbolo 4ASK, que representa 2 bits, se dibuja en 3 celdas consecutivas.
-ASK4_REPEAT = 3
+ASK4_REPEAT = 4
 
 # Repetición espacial para CSK/RGB.
 # 1 = máxima velocidad; si la cámara confunde colores, se puede subir a 2.
-CSK_REPEAT = 1
+CSK_REPEAT = 2
 
 
 # ─────────────────────────── TEXTO DE PRUEBA ─────────────────────────────────
@@ -199,6 +199,11 @@ class Tx:
         CHECKSUM_BITS
     )
 
+    # Perfil largo alcance: cada bit de cabecera se dibuja 3 veces.
+    # Esto reduce muchos descartes por preámbulo/cabecera inválida a 1.5–2 m.
+    HEADER_REPEAT = 3
+    HEADER_CELLS = HEADER_BITS * HEADER_REPEAT
+
     # Fiduciales
     FID_SIZE = 9
     QUIET = 1
@@ -315,7 +320,7 @@ class Tx:
         self._data_positions = self._build_data_positions()
 
         self._data_cells = len(self._data_positions)
-        self._header_cells = self.HEADER_BITS
+        self._header_cells = self.HEADER_CELLS
         self._payload_cells = self._data_cells - self._header_cells
 
         if self._payload_cells < 2:
@@ -584,13 +589,24 @@ class Tx:
 
         self._gen_img()
 
-    def _build_header(self, n_total: int, idx: int, n_real: int, crc: int) -> list[int]:
+    def _build_header_bits(self, n_total: int, idx: int, n_real: int, crc: int) -> list[int]:
         return (
             self._int_to_bits(self.PREAMBLE, self.PREAMBLE_BITS) +
             self._int_to_bits(n_total, self.NTOTAL_BITS) +
             self._int_to_bits(idx, self.NFRAME_BITS) +
             self._int_to_bits(n_real, self.NPAYLOAD_BITS) +
             self._int_to_bits(crc, self.CHECKSUM_BITS)
+        )
+
+    def _repeat_header_bits(self, header_bits: list[int]) -> list[int]:
+        repeated = []
+        for bit in header_bits:
+            repeated.extend([int(bit)] * self.HEADER_REPEAT)
+        return repeated
+
+    def _build_header(self, n_total: int, idx: int, n_real: int, crc: int) -> list[int]:
+        return self._repeat_header_bits(
+            self._build_header_bits(n_total, idx, n_real, crc)
         )
 
     def _build_frames(self) -> list[list[float]]:
@@ -704,7 +720,11 @@ class Tx:
         invalid_count = 0
 
         for frame_cells in self._frame_cells_list:
-            raw_bits = [1 if x >= 0.5 else 0 for x in frame_cells[:self.HEADER_BITS]]
+            raw_repeated = [1 if x >= 0.5 else 0 for x in frame_cells[:self.HEADER_CELLS]]
+            raw_bits = []
+            for i in range(0, len(raw_repeated), self.HEADER_REPEAT):
+                group = raw_repeated[i:i + self.HEADER_REPEAT]
+                raw_bits.append(1 if sum(group) >= (self.HEADER_REPEAT // 2 + 1) else 0)
 
             ptr = 0
 
@@ -731,7 +751,7 @@ class Tx:
                 invalid_count += 1
                 continue
 
-            payload_start = self.HEADER_BITS
+            payload_start = self.HEADER_CELLS
 
             if self.modulation == "OOK_MANCHESTER":
                 payload_cells_count = n_payload * 2
@@ -943,7 +963,7 @@ class Tx:
         print("Información TX")
         print("──────────────")
         print(f"Modulación: {self.modulation}")
-        print("Perfil TX: 2 m robusto, fiduciales 9×9, brillo visual 88%")
+        print("Perfil TX: 2 m v2, fiduciales 9×9, cabecera 3×, brillo visual 85%")
         print(f"Símbolo lógico: {N}×{N} = {N * N} celdas")
         print(f"Borde externo: {self.BORDER} celdas")
         print(f"Fiduciales: 4 patrones de {self.FID_SIZE}×{self.FID_SIZE}")
@@ -951,10 +971,10 @@ class Tx:
         print(f"Pilotos por nivel: 4 niveles × 4 pilotos = 16 pilotos")
         print(f"Celdas reservadas totales: {int(self._reserved_mask.sum())}")
         print(f"Celdas de datos disponibles: {nd}")
-        print(f"Cabecera: {hc} celdas")
+        print(f"Cabecera física: {hc} celdas")
         print(
-            "  preámbulo 16b + N_total 16b + N_frame 16b "
-            "+ N_payload 16b + CRC-16 16b"
+            "  cabecera lógica 80b repetida 3×: preámbulo 16b + N_total 16b + "
+            "N_frame 16b + N_payload 16b + CRC-16 16b"
         )
 
         if self.modulation == "OOK_MANCHESTER":

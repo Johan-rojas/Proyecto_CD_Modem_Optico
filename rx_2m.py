@@ -48,10 +48,10 @@ PRINT_FPS_EVERY_SECOND = False
 
 ENABLE_BER_EVALUATION = True
 
-ASK4_REPEAT = 3
+ASK4_REPEAT = 4
 
 # Repetición espacial para CSK/RGB. Debe coincidir con tx_final.py.
-CSK_REPEAT = 1
+CSK_REPEAT = 2
 
 EXPECTED_TEXT = (
     "La vision artificial permite interpretar imagenes mediante algoritmos "
@@ -108,6 +108,11 @@ HEADER_BITS = (
     NPAYLOAD_BITS +
     CHECKSUM_BITS
 )
+
+# Perfil largo alcance: cabecera física protegida por repetición 3×.
+# El receptor decide cada bit de cabecera por mayoría.
+HEADER_REPEAT = 3
+HEADER_CELLS = HEADER_BITS * HEADER_REPEAT
 
 MAX_TOTAL_FRAMES = 100
 
@@ -184,7 +189,7 @@ DATA_POSITIONS = [
 ]
 
 DATA_CELLS = len(DATA_POSITIONS)
-PAYLOAD_CELLS = DATA_CELLS - HEADER_BITS
+PAYLOAD_CELLS = DATA_CELLS - HEADER_CELLS
 
 OOK_MAX_PAYLOAD_BITS_PER_FRAME = PAYLOAD_CELLS // 2
 ASK4_MAX_PAYLOAD_BITS_PER_FRAME = (PAYLOAD_CELLS // ASK4_REPEAT) * 2
@@ -306,25 +311,41 @@ def manchester_decode(bits: list) -> Optional[list]:
     return decoded
 
 
+def majority_decode_repeated_header(binary_bits: list[int]) -> Optional[list[int]]:
+    if len(binary_bits) < HEADER_CELLS:
+        return None
+
+    decoded = []
+    for i in range(0, HEADER_CELLS, HEADER_REPEAT):
+        group = binary_bits[i:i + HEADER_REPEAT]
+        if len(group) < HEADER_REPEAT:
+            return None
+        decoded.append(1 if sum(group) >= (HEADER_REPEAT // 2 + 1) else 0)
+
+    return decoded
+
+
 def parse_common_header(binary_bits: list[int]):
-    if len(binary_bits) < HEADER_BITS:
+    header_bits = majority_decode_repeated_header(binary_bits)
+
+    if header_bits is None or len(header_bits) < HEADER_BITS:
         return None
 
     ptr = 0
 
-    preamble = bits_to_int(binary_bits[ptr:ptr + PREAMBLE_BITS])
+    preamble = bits_to_int(header_bits[ptr:ptr + PREAMBLE_BITS])
     ptr += PREAMBLE_BITS
 
-    n_total = bits_to_int(binary_bits[ptr:ptr + NTOTAL_BITS])
+    n_total = bits_to_int(header_bits[ptr:ptr + NTOTAL_BITS])
     ptr += NTOTAL_BITS
 
-    n_frame = bits_to_int(binary_bits[ptr:ptr + NFRAME_BITS])
+    n_frame = bits_to_int(header_bits[ptr:ptr + NFRAME_BITS])
     ptr += NFRAME_BITS
 
-    n_payload = bits_to_int(binary_bits[ptr:ptr + NPAYLOAD_BITS])
+    n_payload = bits_to_int(header_bits[ptr:ptr + NPAYLOAD_BITS])
     ptr += NPAYLOAD_BITS
 
-    crc_rx = bits_to_int(binary_bits[ptr:ptr + CHECKSUM_BITS])
+    crc_rx = bits_to_int(header_bits[ptr:ptr + CHECKSUM_BITS])
     ptr += CHECKSUM_BITS
 
     if preamble != PREAMBLE:
@@ -450,7 +471,7 @@ def try_decode_payload_ook(binary_bits: list[int], header: dict):
         return None
 
     needed_cells = n_payload * 2
-    start = HEADER_BITS
+    start = HEADER_CELLS
     end = start + needed_cells
 
     if end > len(binary_bits):
@@ -486,7 +507,7 @@ def try_decode_payload_ask4(cell_means: list[float], header: dict, calibration: 
     ask4_symbols = math.ceil(n_payload / 2)
     needed_cells = ask4_symbols * ASK4_REPEAT
 
-    start = HEADER_BITS
+    start = HEADER_CELLS
     end = start + needed_cells
 
     if end > len(cell_means):
@@ -521,7 +542,7 @@ def try_decode_payload_csk(color_means: list[np.ndarray], header: dict, calibrat
     csk_symbols = math.ceil(n_payload / 2)
     needed_cells = csk_symbols * CSK_REPEAT
 
-    start = HEADER_BITS
+    start = HEADER_CELLS
     end = start + needed_cells
 
     if end > len(color_means):
@@ -595,8 +616,10 @@ def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> 
     c0 = int(c_cell * cell_px)
     c1 = int((c_cell + 1) * cell_px)
 
-    margin_r = max(1, (r1 - r0) // 5)
-    margin_c = max(1, (c1 - c0) // 5)
+    # En 2 m hay más blur y mezcla entre celdas; se toma una zona central
+    # más estricta y se usa media recortada para reducir bordes/reflejos.
+    margin_r = max(1, int((r1 - r0) * 0.28))
+    margin_c = max(1, int((c1 - c0) * 0.28))
 
     patch = gray_img[
         r0 + margin_r:r1 - margin_r,
@@ -606,7 +629,15 @@ def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> 
     if patch.size == 0:
         return 0.0
 
-    return float(patch.mean())
+    values = patch.astype(np.float32).ravel()
+    if values.size >= 10:
+        lo = np.percentile(values, 10)
+        hi = np.percentile(values, 90)
+        trimmed = values[(values >= lo) & (values <= hi)]
+        if trimmed.size > 0:
+            return float(trimmed.mean())
+
+    return float(values.mean())
 
 
 
@@ -620,8 +651,8 @@ def cell_color_mean(bgr_img, row: int, col: int, cell_px: float, border: int = 0
     c0 = int(c_cell * cell_px)
     c1 = int((c_cell + 1) * cell_px)
 
-    margin_r = max(1, (r1 - r0) // 5)
-    margin_c = max(1, (c1 - c0) // 5)
+    margin_r = max(1, int((r1 - r0) * 0.28))
+    margin_c = max(1, int((c1 - c0) * 0.28))
 
     patch = bgr_img[
         r0 + margin_r:r1 - margin_r,
@@ -631,7 +662,17 @@ def cell_color_mean(bgr_img, row: int, col: int, cell_px: float, border: int = 0
     if patch.size == 0:
         return np.zeros(3, dtype=float)
 
-    return patch.reshape(-1, 3).mean(axis=0).astype(float)
+    values = patch.reshape(-1, 3).astype(np.float32)
+    if values.shape[0] >= 10:
+        # Media recortada por luminancia para reducir píxeles contaminados en bordes.
+        lum = values.mean(axis=1)
+        lo = np.percentile(lum, 10)
+        hi = np.percentile(lum, 90)
+        trimmed = values[(lum >= lo) & (lum <= hi)]
+        if trimmed.size > 0:
+            return trimmed.mean(axis=0).astype(float)
+
+    return values.mean(axis=0).astype(float)
 
 def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0, warp_bgr=None):
     level_means = {}
@@ -947,7 +988,7 @@ class Rx:
         print(f"Backend:    {self.cap.getBackendName()}")
         print(f"Warp size:  {self.warp_size}x{self.warp_size}")
         print(f"Scale:      {self.scale}")
-        print("Perfil RX:  2 m robusto, fiduciales 9×9, autofocus activo")
+        print("Perfil RX:  2 m v2, fiduciales 9×9, cabecera 3×, muestreo central robusto")
         print(f"Modo RX:    {self.modulation}")
         print(f"Estabilidad requerida: {self._required_stable}")
 
