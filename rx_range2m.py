@@ -23,7 +23,7 @@ import numpy as np
 RX_MODULATION = "AUTO"
 
 SYMBOL_SIZE = 40
-FID_SIZE = 9
+FID_SIZE = 7
 QUIET_INNER = 1
 BORDER = 2
 FQ = FID_SIZE + QUIET_INNER
@@ -46,11 +46,12 @@ PRINT_CRC_ERRORS = False
 SAVE_DEBUG_IMAGE = False
 PRINT_FPS_EVERY_SECOND = False
 
-# Muestreo robusto del centro de cada celda.
-# Mantiene la version estable 40x40, pero reduce ruido de bordes/reflejos.
-CELL_CENTER_MARGIN_FRACTION = 0.22
-CELL_STATISTIC = "TRIMMED_MEAN"  # opciones: MEAN, MEDIAN, TRIMMED_MEAN
-COLOR_STATISTIC = "MEDIAN"      # opciones: MEAN, MEDIAN
+# Ajustes específicos para 2 m.
+# La primera causa de fallo observada fue fiduciales 1/4 o 2/4, por eso se agrega
+# respaldo por borde externo del símbolo cuando no se detectan las 4 esquinas.
+ENABLE_OUTER_ROI_FALLBACK = True
+OUTER_ROI_MIN_AREA_FRACTION = 0.00035
+OUTER_ROI_MAX_AREA_FRACTION = 0.08000
 
 ENABLE_BER_EVALUATION = True
 
@@ -79,20 +80,20 @@ VALID_RX_MODULATIONS = {
 # Pilotos de 4 niveles. Deben coincidir con tx_final.py.
 PILOT_LEVEL_POSITIONS = {
     0: [
-        (11, 11), (28, 28),
-        (13, 20), (20, 13),
+        (8, 8), (31, 31),
+        (10, 20), (20, 10),
     ],
     1: [
-        (11, 12), (28, 27),
-        (14, 20), (20, 14),
+        (8, 9), (31, 30),
+        (11, 20), (20, 11),
     ],
     2: [
-        (11, 28), (28, 11),
-        (26, 20), (20, 26),
+        (8, 30), (31, 9),
+        (28, 20), (20, 28),
     ],
     3: [
-        (11, 29), (28, 10),
-        (27, 20), (20, 27),
+        (8, 31), (31, 8),
+        (29, 20), (20, 29),
     ],
 }
 
@@ -592,7 +593,7 @@ def parse_and_decode_frame(cell_means: list[float], color_means: list[np.ndarray
 _debug_saved = False
 
 
-def _center_patch(img, row: int, col: int, cell_px: float, border: int = 0):
+def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> float:
     r_cell = row + border
     c_cell = col + border
 
@@ -601,51 +602,43 @@ def _center_patch(img, row: int, col: int, cell_px: float, border: int = 0):
     c0 = int(c_cell * cell_px)
     c1 = int((c_cell + 1) * cell_px)
 
-    margin_r = max(1, int((r1 - r0) * CELL_CENTER_MARGIN_FRACTION))
-    margin_c = max(1, int((c1 - c0) * CELL_CENTER_MARGIN_FRACTION))
+    margin_r = max(1, (r1 - r0) // 5)
+    margin_c = max(1, (c1 - c0) // 5)
 
-    patch = img[
+    patch = gray_img[
         r0 + margin_r:r1 - margin_r,
         c0 + margin_c:c1 - margin_c
     ]
 
-    return patch
-
-
-def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> float:
-    patch = _center_patch(gray_img, row, col, cell_px, border)
-
     if patch.size == 0:
         return 0.0
 
-    values = patch.astype(np.float32).ravel()
+    return float(patch.mean())
 
-    if CELL_STATISTIC == "MEDIAN":
-        return float(np.median(values))
 
-    if CELL_STATISTIC == "TRIMMED_MEAN" and values.size >= 10:
-        lo = np.percentile(values, 10)
-        hi = np.percentile(values, 90)
-        trimmed = values[(values >= lo) & (values <= hi)]
-        if trimmed.size > 0:
-            return float(trimmed.mean())
-
-    return float(values.mean())
 
 
 def cell_color_mean(bgr_img, row: int, col: int, cell_px: float, border: int = 0) -> np.ndarray:
-    patch = _center_patch(bgr_img, row, col, cell_px, border)
+    r_cell = row + border
+    c_cell = col + border
+
+    r0 = int(r_cell * cell_px)
+    r1 = int((r_cell + 1) * cell_px)
+    c0 = int(c_cell * cell_px)
+    c1 = int((c_cell + 1) * cell_px)
+
+    margin_r = max(1, (r1 - r0) // 5)
+    margin_c = max(1, (c1 - c0) // 5)
+
+    patch = bgr_img[
+        r0 + margin_r:r1 - margin_r,
+        c0 + margin_c:c1 - margin_c
+    ]
 
     if patch.size == 0:
         return np.zeros(3, dtype=float)
 
-    values = patch.reshape(-1, 3).astype(np.float32)
-
-    if COLOR_STATISTIC == "MEDIAN":
-        return np.median(values, axis=0).astype(float)
-
-    return values.mean(axis=0).astype(float)
-
+    return patch.reshape(-1, 3).mean(axis=0).astype(float)
 
 def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0, warp_bgr=None):
     level_means = {}
@@ -712,7 +705,10 @@ def read_symbol_cells(warp_gray, warp_bgr=None, symbol_size=SYMBOL_SIZE, border=
     global _debug_saved
 
     H, W = warp_gray.shape
-    cell_px = H / symbol_size
+    # Si border > 0, el warp corresponde a la imagen completa transmitida
+    # con borde externo. Si border = 0, corresponde al caso normal por fiduciales.
+    total_cells = symbol_size + 2 * border
+    cell_px = H / total_cells
 
     calibration = estimate_calibration_with_pilots(warp_gray, cell_px, border, warp_bgr=warp_bgr)
     threshold = calibration["binary_threshold"]
@@ -864,6 +860,99 @@ def order_corners(fiducials):
     return tl, tr, br, bl
 
 
+
+# ─────────────────────────── RESPALDO ROI EXTERNO 2 m ───────────────────────
+def order_points_clockwise(pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float32)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).flatten()
+
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    ordered[0] = pts[np.argmin(s)]      # TL
+    ordered[2] = pts[np.argmax(s)]      # BR
+    ordered[1] = pts[np.argmin(diff)]   # TR
+    ordered[3] = pts[np.argmax(diff)]   # BL
+    return ordered
+
+
+def detect_outer_symbol_quad(frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Respaldo para 2 m: si no aparecen los 4 fiduciales, intenta encontrar
+    el cuadrado claro completo del símbolo sobre la pantalla oscura.
+
+    Devuelve puntos TL,TR,BR,BL en coordenadas del frame original.
+    """
+    if not ENABLE_OUTER_ROI_FALLBACK:
+        return None
+
+    h, w = frame_bgr.shape[:2]
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    area_min = max(300.0, OUTER_ROI_MIN_AREA_FRACTION * h * w)
+    area_max = OUTER_ROI_MAX_AREA_FRACTION * h * w
+
+    # Umbrales múltiples: a 2 m la exposición cambia bastante.
+    p85 = int(np.percentile(blur, 85))
+    p90 = int(np.percentile(blur, 90))
+    p95 = int(np.percentile(blur, 95))
+    thresholds = sorted(set([110, 125, 140, 155, p85, p90, p95]), reverse=True)
+
+    best = None
+    best_score = -1.0
+
+    for thr in thresholds:
+        _, mask = cv2.threshold(blur, thr, 255, cv2.THRESH_BINARY)
+
+        # Une las celdas claras del símbolo para obtener un contorno externo.
+        k_close = np.ones((9, 9), np.uint8)
+        k_open = np.ones((3, 3), np.uint8)
+        mask2 = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=2)
+        mask2 = cv2.morphologyEx(mask2, cv2.MORPH_OPEN, k_open, iterations=1)
+
+        contours, _ = cv2.findContours(mask2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in contours:
+            area = float(cv2.contourArea(cnt))
+            if area < area_min or area > area_max:
+                continue
+
+            rect = cv2.minAreaRect(cnt)
+            rw, rh = rect[1]
+            if rw <= 1 or rh <= 1:
+                continue
+
+            aspect = max(rw, rh) / max(1.0, min(rw, rh))
+            if aspect > 1.45:
+                continue
+
+            box = cv2.boxPoints(rect).astype(np.float32)
+            pts = order_points_clockwise(box)
+
+            # Valida que dentro haya patrón, no solo pared/luz uniforme.
+            dst = np.array([[0, 0], [120, 0], [120, 120], [0, 120]], dtype=np.float32)
+            M = cv2.getPerspectiveTransform(pts, dst)
+            roi = cv2.warpPerspective(gray, M, (120, 120), flags=cv2.INTER_CUBIC)
+            roi_std = float(np.std(roi))
+            roi_mean = float(np.mean(roi))
+
+            if roi_std < 18.0:
+                continue
+
+            # Favorece cuadrados con textura interna y buen tamaño.
+            square_score = max(0.0, 1.45 - aspect)
+            score = (area ** 0.5) * (roi_std + 1.0) * square_score
+
+            # Evita candidatos gigantes de pared o pantalla completa.
+            if roi_mean < 45:
+                score *= 0.5
+
+            if score > best_score:
+                best_score = score
+                best = pts
+
+    return best
+
 # ─────────────────────────── CLASE RECEPTOR ──────────────────────────────────
 class Rx:
     def __init__(self, scale=PROCESS_SCALE, warp_size=WARP_SIZE, modulation="AUTO"):
@@ -926,40 +1015,20 @@ class Rx:
             self.cap.read()
 
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-        self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 113)
-        self.cap.set(cv2.CAP_PROP_CONTRAST, 128)
-        self.cap.set(cv2.CAP_PROP_GAIN, 34)
-
-        # Para 2 m conviene dejar que la cámara enfoque la pantalla real
-        # al iniciar; luego se congela para que no varíe durante la transmisión.
-        try:
-            if ENABLE_AUTOFOCUS_STARTUP:
-                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-                for _ in range(AUTOFOCUS_WARMUP_FRAMES):
-                    self.cap.read()
-                if FREEZE_FOCUS_AFTER_STARTUP:
-                    self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-            else:
-                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-        except Exception:
-            pass
-
-        try:
-            self.cap.set(cv2.CAP_PROP_SHARPNESS, 255)
-        except Exception:
-            pass
-
-        # Congela balance de blancos si la cámara lo soporta.
-        # Esto ayuda especialmente a CSK_RGB, porque evita que la cámara cambie
-        # la mezcla de colores durante la transmisión.
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, -7)
+        self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 80)
+        self.cap.set(cv2.CAP_PROP_CONTRAST, 115)
+        self.cap.set(cv2.CAP_PROP_GAIN, 8)
+        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+        # No forzamos FOCUS=0: a 2 m puede desenfocar. Dejamos autofocus si la cámara lo soporta.
         try:
             self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
             self.cap.set(cv2.CAP_PROP_WB_TEMPERATURE, 4500)
+            self.cap.set(cv2.CAP_PROP_SHARPNESS, 180)
         except Exception:
             pass
 
-        for _ in range(5):
+        for _ in range(12):
             self.cap.read()
 
         print(f"FPS:        {self.cap.get(cv2.CAP_PROP_FPS)}")
@@ -1187,16 +1256,26 @@ class Rx:
             c = ((f["center"] / self.scale) + offset).astype(int)
             cv2.circle(debug, tuple(c), 5, (0, 0, 255), -1)
 
+        read_border = 0
+        fallback_used = False
+
         if len(fiducials) < 4:
-            self._draw_hud(debug, fid_count=len(fiducials))
-            return debug, None, self._decoded_text
+            outer_pts = detect_outer_symbol_quad(frame)
 
-        sel = fiducials[:4] if len(fiducials) == 4 else self._best_four(fiducials)
-        tl, tr, br, bl = order_corners(sel)
+            if outer_pts is None:
+                self._draw_hud(debug, fid_count=len(fiducials))
+                return debug, None, self._decoded_text
 
-        pts_orig = (np.array([tl, tr, br, bl]) / self.scale + offset).astype(np.float32)
+            pts_orig = outer_pts.astype(np.float32)
+            read_border = BORDER
+            fallback_used = True
+            self._last_event_msg = f"ROI por borde externo | fiduciales={len(fiducials)}/4"
+        else:
+            sel = fiducials[:4] if len(fiducials) == 4 else self._best_four(fiducials)
+            tl, tr, br, bl = order_corners(sel)
+            pts_orig = (np.array([tl, tr, br, bl]) / self.scale + offset).astype(np.float32)
 
-        cv2.polylines(debug, [pts_orig.astype(np.int32)], True, (255, 0, 0), 2)
+        cv2.polylines(debug, [pts_orig.astype(np.int32)], True, (0, 255, 255) if fallback_used else (255, 0, 0), 2)
 
         for p, lbl in zip(pts_orig.astype(int), ["TL", "TR", "BR", "BL"]):
             cv2.circle(debug, tuple(p), 6, (255, 255, 0), -1)
@@ -1218,11 +1297,11 @@ class Rx:
         )
 
         M = cv2.getPerspectiveTransform(pts_orig, dst)
-        warp = cv2.warpPerspective(frame, M, (ws, ws))
+        warp = cv2.warpPerspective(frame, M, (ws, ws), flags=cv2.INTER_CUBIC)
 
         warp_gray = cv2.cvtColor(warp, cv2.COLOR_BGR2GRAY)
 
-        cell_means, color_means, binary_bits, calibration = read_symbol_cells(warp_gray, warp_bgr=warp, border=0)
+        cell_means, color_means, binary_bits, calibration = read_symbol_cells(warp_gray, warp_bgr=warp, border=read_border)
         self._last_calibration = calibration
 
         # Firma simple para estabilidad.

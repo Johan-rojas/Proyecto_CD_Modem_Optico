@@ -44,6 +44,12 @@ ASK4_REPEAT = 3
 # 1 = máxima velocidad; si la cámara confunde colores, se puede subir a 2.
 CSK_REPEAT = 1
 
+# Ajuste de visualización para 2 m:
+# No mostramos blanco puro porque a distancia la webcam tiende a saturar la pantalla
+# y se pierden bordes/fiduciales. Se mantiene contraste alto, pero con blanco atenuado.
+DISPLAY_BLACK_LEVEL = 0.02
+DISPLAY_WHITE_LEVEL = 0.82
+
 
 # ─────────────────────────── TEXTO DE PRUEBA ─────────────────────────────────
 DEMO_TEXT = (
@@ -196,7 +202,7 @@ class Tx:
     )
 
     # Fiduciales
-    FID_SIZE = 9
+    FID_SIZE = 7
     QUIET = 1
     BORDER = 2
 
@@ -210,20 +216,20 @@ class Tx:
     # Deben coincidir exactamente con rx.py.
     PILOT_LEVEL_POSITIONS = {
         0: [
-            (11, 11), (28, 28),
-            (13, 20), (20, 13),
+            (8, 8), (31, 31),
+            (10, 20), (20, 10),
         ],
         1: [
-            (11, 12), (28, 27),
-            (14, 20), (20, 14),
+            (8, 9), (31, 30),
+            (11, 20), (20, 11),
         ],
         2: [
-            (11, 28), (28, 11),
-            (26, 20), (20, 26),
+            (8, 30), (31, 9),
+            (28, 20), (20, 28),
         ],
         3: [
-            (11, 29), (28, 10),
-            (27, 20), (20, 27),
+            (8, 31), (31, 8),
+            (29, 20), (20, 29),
         ],
     }
 
@@ -344,18 +350,9 @@ class Tx:
 
     # ─────────────────────────── ESPACIAL ─────────────────────────────────────
     def _patron_fiducial(self) -> np.ndarray:
-        """
-        Fiducial dinámico tipo anillo negro/blanco/negro.
-        Para la versión 2 m se usa FID_SIZE=9, más visible desde lejos.
-        """
         f = np.zeros((self.FID_SIZE, self.FID_SIZE), dtype=float)
-        f[1:self.FID_SIZE - 1, 1:self.FID_SIZE - 1] = 1.0
-
-        center_margin = max(2, self.FID_SIZE // 3)
-        f[
-            center_margin:self.FID_SIZE - center_margin,
-            center_margin:self.FID_SIZE - center_margin,
-        ] = 0.0
+        f[1:6, 1:6] = 1.0
+        f[2:5, 2:5] = 0.0
         return f
 
     def _all_pilot_positions(self) -> list[tuple[int, int]]:
@@ -654,6 +651,15 @@ class Tx:
 
         return frames
 
+    def _apply_display_levels(self, img: np.ndarray) -> np.ndarray:
+        """
+        Atenúa el blanco mostrado sin cambiar la codificación lógica interna.
+        Esto reduce saturación de la pantalla cuando la cámara está lejos.
+        """
+        arr = np.asarray(img, dtype=float)
+        arr = np.clip(arr, 0.0, 1.0)
+        return DISPLAY_BLACK_LEVEL + arr * (DISPLAY_WHITE_LEVEL - DISPLAY_BLACK_LEVEL)
+
     def _gen_img(self) -> None:
         N = self.symbol_size
         B = self.BORDER
@@ -687,6 +693,7 @@ class Tx:
                 bordered = np.ones((N + 2 * B, N + 2 * B), dtype=float)
                 bordered[B:B + N, B:B + N] = symbol
 
+            bordered = self._apply_display_levels(bordered)
             imgs.append(bordered)
 
         self.vec_imgs = imgs
@@ -876,6 +883,7 @@ class Tx:
         print(f"Delay por trama: {delay:.3f} s")
         print(f"Tramas por ciclo: {n}")
         print(f"Tiempo ideal de ciclo TX: {n * delay:.3f} s")
+        print(f"Blanco mostrado para 2 m: {DISPLAY_WHITE_LEVEL:.2f} | negro: {DISPLAY_BLACK_LEVEL:.2f}")
 
         if self.modulation == "ASK4_GRAY":
             print(f"ASK4_REPEAT: {self.ask4_repeat}")
