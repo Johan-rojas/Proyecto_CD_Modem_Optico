@@ -46,6 +46,12 @@ PRINT_CRC_ERRORS = False
 SAVE_DEBUG_IMAGE = False
 PRINT_FPS_EVERY_SECOND = False
 
+# Enfoque para pruebas a mayor distancia.
+# Estas variables eran usadas en open_camera(), pero faltaban en la configuración.
+ENABLE_AUTOFOCUS_STARTUP = True
+AUTOFOCUS_WARMUP_FRAMES = 30
+FREEZE_FOCUS_AFTER_STARTUP = True
+
 # Muestreo robusto del centro de cada celda.
 # Mantiene la version estable 40x40, pero reduce ruido de bordes/reflejos.
 CELL_CENTER_MARGIN_FRACTION = 0.22
