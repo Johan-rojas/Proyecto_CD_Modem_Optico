@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 
-# ─────────────────────────── CONFIGURACIÓN GENERAL ───────────────────────────
+# ─────────────────────────── CONFIGURACIÓN GENERAL LONG RANGE ───────────────────────────
 # Modos:
 #   AUTO
 #   OOK_MANCHESTER
@@ -22,8 +22,8 @@ import numpy as np
 #   python rx.py AUTO
 RX_MODULATION = "AUTO"
 
-SYMBOL_SIZE = 40
-FID_SIZE = 7
+SYMBOL_SIZE = 30
+FID_SIZE = 5
 QUIET_INNER = 1
 BORDER = 2
 FQ = FID_SIZE + QUIET_INNER
@@ -50,8 +50,9 @@ ENABLE_BER_EVALUATION = True
 
 ASK4_REPEAT = 3
 
-# Repetición espacial para CSK/RGB. Debe coincidir con tx_final.py.
-CSK_REPEAT = 1
+# Repetición espacial para CSK/RGB. Debe coincidir con tx_final_long_range.py.
+# 2 = mayor robustez para pruebas a 2 m; para máxima velocidad se puede usar 1.
+CSK_REPEAT = 2
 
 EXPECTED_TEXT = (
     "La vision artificial permite interpretar imagenes mediante algoritmos "
@@ -72,21 +73,23 @@ VALID_RX_MODULATIONS = {
 
 # Pilotos de 4 niveles. Deben coincidir con tx_final.py.
 PILOT_LEVEL_POSITIONS = {
+    # Versión long range 30×30.
+    # Deben coincidir exactamente con tx_final_long_range.py.
     0: [
-        (8, 8), (31, 31),
-        (10, 20), (20, 10),
+        (7, 7), (22, 22),
+        (9, 15), (15, 9),
     ],
     1: [
-        (8, 9), (31, 30),
-        (11, 20), (20, 11),
+        (7, 8), (22, 21),
+        (10, 15), (15, 10),
     ],
     2: [
-        (8, 30), (31, 9),
-        (28, 20), (20, 28),
+        (7, 22), (22, 7),
+        (20, 15), (15, 20),
     ],
     3: [
-        (8, 31), (31, 8),
-        (29, 20), (20, 29),
+        (7, 23), (22, 6),
+        (21, 15), (15, 21),
     ],
 }
 
