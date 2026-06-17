@@ -13,10 +13,12 @@ import numpy as np
 # Modos disponibles:
 #   OOK_MANCHESTER  → modo principal estable
 #   ASK4_GRAY       → segunda modulación física con repetición espacial
+#   CSK_RGB         → modulación por color RGB/CSK experimental
 #
 # Uso:
 #   python tx_final.py OOK_MANCHESTER
 #   python tx_final.py ASK4_GRAY
+#   python tx_final.py CSK_RGB
 MODULATION = "OOK_MANCHESTER"
 
 SYMBOL_SIZE = 40
@@ -24,6 +26,7 @@ SYMBOL_SIZE = 40
 # Delay por modulación
 TX_DELAY_OOK = 0.10
 TX_DELAY_ASK4 = 0.10
+TX_DELAY_CSK = 0.10
 
 FULLSCREEN = True
 
@@ -36,6 +39,10 @@ RUN_DIGITAL_LOOPBACK_TEST = False
 # Repetición espacial para 4ASK:
 # cada símbolo 4ASK, que representa 2 bits, se dibuja en 3 celdas consecutivas.
 ASK4_REPEAT = 3
+
+# Repetición espacial para CSK/RGB.
+# 1 = máxima velocidad; si la cámara confunde colores, se puede subir a 2.
+CSK_REPEAT = 1
 
 
 # ─────────────────────────── TEXTO DE PRUEBA ─────────────────────────────────
@@ -165,6 +172,8 @@ def load_text_from_args(default_text: str) -> str:
 def tx_delay_for_modulation(modulation: str) -> float:
     if modulation == "ASK4_GRAY":
         return TX_DELAY_ASK4
+    if modulation == "CSK_RGB":
+        return TX_DELAY_CSK
     return TX_DELAY_OOK
 
 
@@ -194,6 +203,7 @@ class Tx:
     VALID_MODULATIONS = {
         "OOK_MANCHESTER",
         "ASK4_GRAY",
+        "CSK_RGB",
     }
 
     # Pilotos de 4 niveles.
@@ -240,11 +250,37 @@ class Tx:
         3: 0.95,
     }
 
+    # Modulación en color tipo CSK/RGB.
+    # Cada celda de color transporta 2 bits. Se usan pilotos de color
+    # para que el receptor clasifique por cercanía a los colores reales capturados.
+    CSK_BITS_TO_LEVEL = {
+        (0, 0): 0,  # rojo
+        (0, 1): 1,  # verde
+        (1, 0): 2,  # azul
+        (1, 1): 3,  # amarillo
+    }
+
+    CSK_LEVEL_TO_BITS = {
+        0: (0, 0),
+        1: (0, 1),
+        2: (1, 0),
+        3: (1, 1),
+    }
+
+    # Matplotlib interpreta imágenes RGB.
+    CSK_LEVEL_VALUES = {
+        0: np.array([1.0, 0.0, 0.0], dtype=float),  # rojo
+        1: np.array([0.0, 1.0, 0.0], dtype=float),  # verde
+        2: np.array([0.0, 0.0, 1.0], dtype=float),  # azul
+        3: np.array([1.0, 1.0, 0.0], dtype=float),  # amarillo
+    }
+
     def __init__(
         self,
         symbol_size: int = 40,
         modulation: str = "OOK_MANCHESTER",
         ask4_repeat: int = ASK4_REPEAT,
+        csk_repeat: int = CSK_REPEAT,
     ):
         modulation = modulation.upper()
 
@@ -263,9 +299,13 @@ class Tx:
         if ask4_repeat < 1:
             raise ValueError("ASK4_REPEAT debe ser >= 1")
 
+        if csk_repeat < 1:
+            raise ValueError("CSK_REPEAT debe ser >= 1")
+
         self.symbol_size = symbol_size
         self.modulation = modulation
         self.ask4_repeat = ask4_repeat
+        self.csk_repeat = csk_repeat
 
         self._reserved_mask = self._build_reserved_mask()
         self._data_positions = self._build_data_positions()
@@ -287,6 +327,11 @@ class Tx:
             # Cada símbolo 4ASK representa 2 bits, pero se repite ask4_repeat veces.
             usable_ask4_symbols = self._payload_cells // self.ask4_repeat
             self._payload_bits_per_frame = usable_ask4_symbols * 2
+
+        elif self.modulation == "CSK_RGB":
+            # Cada celda de color CSK representa 2 bits.
+            usable_csk_symbols = self._payload_cells // self.csk_repeat
+            self._payload_bits_per_frame = usable_csk_symbols * 2
 
         else:
             raise RuntimeError("Modulación no reconocida.")
@@ -356,10 +401,17 @@ class Tx:
         ]:
             symbol[r0:r0 + FQ, c0:c0 + FQ] = 1.0
 
-            symbol[
-                r0 + dr:r0 + dr + self.FID_SIZE,
-                c0 + dc:c0 + dc + self.FID_SIZE
-            ] = fid
+            if symbol.ndim == 3:
+                symbol[
+                    r0 + dr:r0 + dr + self.FID_SIZE,
+                    c0 + dc:c0 + dc + self.FID_SIZE,
+                    :
+                ] = fid[:, :, None]
+            else:
+                symbol[
+                    r0 + dr:r0 + dr + self.FID_SIZE,
+                    c0 + dc:c0 + dc + self.FID_SIZE
+                ] = fid
 
     def _pilot_value_for_level(self, level: int) -> float:
         if self.modulation == "OOK_MANCHESTER":
@@ -369,6 +421,9 @@ class Tx:
 
         if self.modulation == "ASK4_GRAY":
             return self.ASK4_LEVEL_VALUES[level]
+
+        if self.modulation == "CSK_RGB":
+            return self.CSK_LEVEL_VALUES[level]
 
         raise RuntimeError("Modulación no reconocida.")
 
@@ -458,6 +513,50 @@ class Tx:
 
         return decoded[:n_bits]
 
+
+    @classmethod
+    def _csk_encode(cls, bits: list[int], repeat: int) -> list[np.ndarray]:
+        cells = []
+
+        for i in range(0, len(bits), 2):
+            b0 = bits[i]
+            b1 = bits[i + 1] if i + 1 < len(bits) else 0
+            level = cls.CSK_BITS_TO_LEVEL[(b0, b1)]
+            color_value = cls.CSK_LEVEL_VALUES[level]
+
+            # Repetición espacial opcional para robustez.
+            for _ in range(repeat):
+                cells.append(color_value.copy())
+
+        return cells
+
+    @classmethod
+    def _csk_decode_ideal(cls, cells: list, n_bits: int, repeat: int) -> list[int]:
+        levels = [
+            (cls.CSK_LEVEL_VALUES[0], (0, 0)),
+            (cls.CSK_LEVEL_VALUES[1], (0, 1)),
+            (cls.CSK_LEVEL_VALUES[2], (1, 0)),
+            (cls.CSK_LEVEL_VALUES[3], (1, 1)),
+        ]
+
+        decoded = []
+
+        for i in range(0, len(cells), repeat):
+            group = cells[i:i + repeat]
+
+            if not group:
+                break
+
+            value = np.median(np.array(group, dtype=float), axis=0)
+            _, bits_pair = min(levels, key=lambda item: float(np.linalg.norm(value - item[0])))
+
+            decoded.extend(list(bits_pair))
+
+            if len(decoded) >= n_bits:
+                break
+
+        return decoded[:n_bits]
+
     @staticmethod
     def _validate_text(texto: str) -> None:
         bad = [(i, c) for i, c in enumerate(texto) if ord(c) > 127]
@@ -516,10 +615,14 @@ class Tx:
                 payload_cells = self._ask4_encode(real_bits, self.ask4_repeat)
                 pad_value = 1.0
 
+            elif self.modulation == "CSK_RGB":
+                payload_cells = self._csk_encode(real_bits, self.csk_repeat)
+                pad_value = np.array([1.0, 1.0, 1.0], dtype=float)
+
             else:
                 raise RuntimeError("Modulación no reconocida.")
 
-            frame_cells = [float(x) for x in header_cells] + [float(x) for x in payload_cells]
+            frame_cells = [float(x) for x in header_cells] + list(payload_cells)
 
             used = len(frame_cells)
             remaining = self._data_cells - used
@@ -552,16 +655,28 @@ class Tx:
         imgs = []
 
         for frame_cells in frames:
-            symbol = np.ones((N, N), dtype=float)
+            if self.modulation == "CSK_RGB":
+                symbol = np.ones((N, N, 3), dtype=float)
+            else:
+                symbol = np.ones((N, N), dtype=float)
 
             for (r, c), value in zip(self._data_positions, frame_cells):
-                symbol[r, c] = float(value)
+                if self.modulation == "CSK_RGB" and isinstance(value, np.ndarray):
+                    symbol[r, c, :] = value
+                elif self.modulation == "CSK_RGB":
+                    symbol[r, c, :] = float(value)
+                else:
+                    symbol[r, c] = float(value)
 
             self._draw_fiducials(symbol)
             self._draw_pilots(symbol)
 
-            bordered = np.ones((N + 2 * B, N + 2 * B), dtype=float)
-            bordered[B:B + N, B:B + N] = symbol
+            if self.modulation == "CSK_RGB":
+                bordered = np.ones((N + 2 * B, N + 2 * B, 3), dtype=float)
+                bordered[B:B + N, B:B + N, :] = symbol
+            else:
+                bordered = np.ones((N + 2 * B, N + 2 * B), dtype=float)
+                bordered[B:B + N, B:B + N] = symbol
 
             imgs.append(bordered)
 
@@ -626,6 +741,16 @@ class Tx:
                     payload_cells,
                     n_payload,
                     self.ask4_repeat
+                )
+
+            elif self.modulation == "CSK_RGB":
+                csk_symbols = math.ceil(n_payload / 2)
+                payload_cells_count = csk_symbols * self.csk_repeat
+                payload_cells = frame_cells[payload_start:payload_start + payload_cells_count]
+                payload_bits = self._csk_decode_ideal(
+                    payload_cells,
+                    n_payload,
+                    self.csk_repeat
                 )
 
             else:
@@ -757,14 +882,21 @@ class Tx:
                     break
 
                 if image_artist is None:
-                    image_artist = ax.imshow(
-                        img,
-                        cmap="gray",
-                        interpolation="nearest",
-                        vmin=0,
-                        vmax=1,
-                        aspect="equal"
-                    )
+                    if img.ndim == 3:
+                        image_artist = ax.imshow(
+                            img,
+                            interpolation="nearest",
+                            aspect="equal"
+                        )
+                    else:
+                        image_artist = ax.imshow(
+                            img,
+                            cmap="gray",
+                            interpolation="nearest",
+                            vmin=0,
+                            vmax=1,
+                            aspect="equal"
+                        )
                 else:
                     image_artist.set_data(img)
 
@@ -781,7 +913,10 @@ class Tx:
         if self.vec_imgs is None or len(self.vec_imgs) == 0:
             raise RuntimeError("No hay frames generados.")
 
-        plt.imsave(filename, self.vec_imgs[0], cmap="gray", vmin=0, vmax=1)
+        if self.vec_imgs[0].ndim == 3:
+            plt.imsave(filename, self.vec_imgs[0])
+        else:
+            plt.imsave(filename, self.vec_imgs[0], cmap="gray", vmin=0, vmax=1)
         print(f"Primer frame guardado en: {filename}")
 
     # ─────────────────────────── INFO ─────────────────────────────────────────
@@ -817,6 +952,12 @@ class Tx:
             print(f"{pc} celdas payload → {pb} bits útiles/frame")
             print(f"Aprox. chars útiles/frame: {pb // 8}")
 
+        elif self.modulation == "CSK_RGB":
+            print(f"Payload CSK/RGB con repetición {self.csk_repeat}×")
+            print(f"{pc} celdas payload → {pb} bits útiles/frame")
+            print(f"Aprox. chars útiles/frame: {pb // 8}")
+            print("Colores: rojo, verde, azul y amarillo, calibrados con pilotos.")
+
         if self.vec_imgs is not None and self._texto is not None:
             print(
                 f"Texto: {len(self._texto)} chars → "
@@ -843,9 +984,19 @@ def save_modulation_examples(texto: str) -> None:
     tx_ask4.encode(texto)
     tx_ask4.save_first_frame(os.path.join("debug_tx", "frame_ASK4_GRAY_REPEAT3.png"))
 
+    tx_csk = Tx(
+        symbol_size=SYMBOL_SIZE,
+        modulation="CSK_RGB",
+        ask4_repeat=ASK4_REPEAT,
+        csk_repeat=CSK_REPEAT,
+    )
+    tx_csk.encode(texto)
+    tx_csk.save_first_frame(os.path.join("debug_tx", "frame_CSK_RGB.png"))
+
     print("Ejemplos de modulación guardados en debug_tx:")
     print("  - frame_OOK_MANCHESTER.png")
     print("  - frame_ASK4_GRAY_REPEAT3.png")
+    print("  - frame_CSK_RGB.png")
     print("")
 
 
@@ -878,10 +1029,21 @@ if __name__ == "__main__":
         tx_test_ask.encode(tx_text)
         tx_test_ask.print_loopback_report()
 
+        print("Prueba interna CSK_RGB")
+        tx_test_csk = Tx(
+            symbol_size=SYMBOL_SIZE,
+            modulation="CSK_RGB",
+            ask4_repeat=ASK4_REPEAT,
+            csk_repeat=CSK_REPEAT,
+        )
+        tx_test_csk.encode(tx_text)
+        tx_test_csk.print_loopback_report()
+
     tx = Tx(
         symbol_size=SYMBOL_SIZE,
         modulation=modulation,
         ask4_repeat=ASK4_REPEAT,
+        csk_repeat=CSK_REPEAT,
     )
 
     tx.encode(tx_text)

@@ -13,10 +13,12 @@ import numpy as np
 #   AUTO
 #   OOK_MANCHESTER
 #   ASK4_GRAY
+#   CSK_RGB
 #
 # Uso:
 #   python rx.py OOK_MANCHESTER
 #   python rx.py ASK4_GRAY
+#   python rx.py CSK_RGB
 #   python rx.py AUTO
 RX_MODULATION = "AUTO"
 
@@ -48,6 +50,9 @@ ENABLE_BER_EVALUATION = True
 
 ASK4_REPEAT = 3
 
+# Repetición espacial para CSK/RGB. Debe coincidir con tx_final.py.
+CSK_REPEAT = 1
+
 EXPECTED_TEXT = (
     "La vision artificial permite interpretar imagenes mediante algoritmos "
     "que detectan patrones, formas y relaciones espaciales. Los sistemas "
@@ -62,6 +67,7 @@ VALID_RX_MODULATIONS = {
     "AUTO",
     "OOK_MANCHESTER",
     "ASK4_GRAY",
+    "CSK_RGB",
 }
 
 # Pilotos de 4 niveles. Deben coincidir con tx_final.py.
@@ -182,10 +188,12 @@ PAYLOAD_CELLS = DATA_CELLS - HEADER_BITS
 
 OOK_MAX_PAYLOAD_BITS_PER_FRAME = PAYLOAD_CELLS // 2
 ASK4_MAX_PAYLOAD_BITS_PER_FRAME = (PAYLOAD_CELLS // ASK4_REPEAT) * 2
+CSK_MAX_PAYLOAD_BITS_PER_FRAME = (PAYLOAD_CELLS // CSK_REPEAT) * 2
 
 BROAD_MAX_PAYLOAD_BITS_PER_FRAME = max(
     OOK_MAX_PAYLOAD_BITS_PER_FRAME,
     ASK4_MAX_PAYLOAD_BITS_PER_FRAME,
+    CSK_MAX_PAYLOAD_BITS_PER_FRAME,
 )
 
 
@@ -377,6 +385,64 @@ def ask4_decode_from_means(payload_means: list[float], n_bits: int, calibration:
     return decoded[:n_bits]
 
 
+
+
+def _chromaticity(vec: np.ndarray) -> np.ndarray:
+    vec = np.asarray(vec, dtype=float)
+    denom = float(np.sum(vec))
+
+    if denom <= 1e-6:
+        return np.zeros_like(vec, dtype=float)
+
+    return vec / denom
+
+
+def csk_decode_from_colors(payload_colors: list[np.ndarray], n_bits: int, calibration: dict) -> list[int]:
+    """
+    Decodifica CSK/RGB con pilotos de color.
+    Cada símbolo de color transporta 2 bits. La decisión se hace por cercanía
+    a los colores piloto capturados por la propia cámara.
+    """
+    color_means = calibration.get("color_level_means")
+
+    if color_means is None:
+        return []
+
+    decoded = []
+
+    level_to_bits = {
+        0: (0, 0),
+        1: (0, 1),
+        2: (1, 0),
+        3: (1, 1),
+    }
+
+    level_chroma = {
+        level: _chromaticity(color_means[level])
+        for level in [0, 1, 2, 3]
+    }
+
+    for i in range(0, len(payload_colors), CSK_REPEAT):
+        group = payload_colors[i:i + CSK_REPEAT]
+
+        if not group:
+            break
+
+        value = np.median(np.array(group, dtype=float), axis=0)
+        value_chroma = _chromaticity(value)
+
+        nearest_level = min(
+            [0, 1, 2, 3],
+            key=lambda level: float(np.linalg.norm(value_chroma - level_chroma[level]))
+        )
+
+        decoded.extend(list(level_to_bits[nearest_level]))
+
+        if len(decoded) >= n_bits:
+            break
+
+    return decoded[:n_bits]
+
 def try_decode_payload_ook(binary_bits: list[int], header: dict):
     n_payload = header["n_payload"]
 
@@ -444,7 +510,41 @@ def try_decode_payload_ask4(cell_means: list[float], header: dict, calibration: 
     }
 
 
-def parse_and_decode_frame(cell_means: list[float], binary_bits: list[int], calibration: dict, rx_mode: str):
+
+
+def try_decode_payload_csk(color_means: list[np.ndarray], header: dict, calibration: dict):
+    n_payload = header["n_payload"]
+
+    if n_payload > CSK_MAX_PAYLOAD_BITS_PER_FRAME:
+        return None
+
+    csk_symbols = math.ceil(n_payload / 2)
+    needed_cells = csk_symbols * CSK_REPEAT
+
+    start = HEADER_BITS
+    end = start + needed_cells
+
+    if end > len(color_means):
+        return None
+
+    payload_colors = color_means[start:end]
+    payload_bits = csk_decode_from_colors(payload_colors, n_payload, calibration)
+
+    if len(payload_bits) != n_payload:
+        return None
+
+    crc_calc = crc16(payload_bits)
+    crc_ok = crc_calc == header["crc_rx"]
+
+    return {
+        **header,
+        "modulation": "CSK_RGB",
+        "crc_ok": crc_ok,
+        "payload": payload_bits,
+        "crc_calc": crc_calc,
+    }
+
+def parse_and_decode_frame(cell_means: list[float], color_means: list[np.ndarray], binary_bits: list[int], calibration: dict, rx_mode: str):
     header = parse_common_header(binary_bits)
 
     if header is None:
@@ -463,6 +563,12 @@ def parse_and_decode_frame(cell_means: list[float], binary_bits: list[int], cali
 
         if decoded_ask4 is not None:
             candidates.append(decoded_ask4)
+
+    if rx_mode in ("AUTO", "CSK_RGB"):
+        decoded_csk = try_decode_payload_csk(color_means, header, calibration)
+
+        if decoded_csk is not None:
+            candidates.append(decoded_csk)
 
     if not candidates:
         return None
@@ -503,7 +609,31 @@ def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> 
     return float(patch.mean())
 
 
-def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0):
+
+
+def cell_color_mean(bgr_img, row: int, col: int, cell_px: float, border: int = 0) -> np.ndarray:
+    r_cell = row + border
+    c_cell = col + border
+
+    r0 = int(r_cell * cell_px)
+    r1 = int((r_cell + 1) * cell_px)
+    c0 = int(c_cell * cell_px)
+    c1 = int((c_cell + 1) * cell_px)
+
+    margin_r = max(1, (r1 - r0) // 5)
+    margin_c = max(1, (c1 - c0) // 5)
+
+    patch = bgr_img[
+        r0 + margin_r:r1 - margin_r,
+        c0 + margin_c:c1 - margin_c
+    ]
+
+    if patch.size == 0:
+        return np.zeros(3, dtype=float)
+
+    return patch.reshape(-1, 3).mean(axis=0).astype(float)
+
+def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0, warp_bgr=None):
     level_means = {}
 
     for level, positions in PILOT_LEVEL_POSITIONS.items():
@@ -537,6 +667,21 @@ def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0)
         "T23": (level_means[2] + level_means[3]) / 2.0,
     }
 
+    color_level_means = None
+
+    if warp_bgr is not None:
+        color_level_means = {}
+
+        for level, positions in PILOT_LEVEL_POSITIONS.items():
+            values = [
+                cell_color_mean(warp_bgr, r, c, cell_px, border)
+                for r, c in positions
+            ]
+            color_level_means[level] = (
+                np.mean(np.array(values, dtype=float), axis=0)
+                if values else np.zeros(3, dtype=float)
+            )
+
     return {
         "mode": mode,
         "binary_threshold": binary_threshold,
@@ -545,19 +690,21 @@ def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0)
         "binary_contrast": binary_contrast,
         "level_means": level_means,
         "ask4_thresholds": ask4_thresholds,
+        "color_level_means": color_level_means,
     }
 
 
-def read_symbol_cells(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
+def read_symbol_cells(warp_gray, warp_bgr=None, symbol_size=SYMBOL_SIZE, border=0):
     global _debug_saved
 
     H, W = warp_gray.shape
     cell_px = H / symbol_size
 
-    calibration = estimate_calibration_with_pilots(warp_gray, cell_px, border)
+    calibration = estimate_calibration_with_pilots(warp_gray, cell_px, border, warp_bgr=warp_bgr)
     threshold = calibration["binary_threshold"]
 
     cell_means = []
+    color_means = []
     binary_bits = []
 
     for row, col in DATA_POSITIONS:
@@ -565,6 +712,11 @@ def read_symbol_cells(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
 
         cell_means.append(mean_val)
         binary_bits.append(1 if mean_val >= threshold else 0)
+
+        if warp_bgr is not None:
+            color_means.append(cell_color_mean(warp_bgr, row, col, cell_px, border))
+        else:
+            color_means.append(np.zeros(3, dtype=float))
 
     if SAVE_DEBUG_IMAGE and not _debug_saved:
         os.makedirs("debug_rx", exist_ok=True)
@@ -609,7 +761,7 @@ def read_symbol_cells(warp_gray, symbol_size=SYMBOL_SIZE, border=0):
             f"L0={lm[0]:.1f} L1={lm[1]:.1f} L2={lm[2]:.1f} L3={lm[3]:.1f}"
         )
 
-    return cell_means, binary_bits, calibration
+    return cell_means, color_means, binary_bits, calibration
 
 
 # ─────────────────────────── DETECTOR DE FIDUCIALES ──────────────────────────
@@ -721,6 +873,7 @@ class Rx:
         self._crc_error_counts = {
             "OOK_MANCHESTER": 0,
             "ASK4_GRAY": 0,
+            "CSK_RGB": 0,
         }
 
         self._last_event_msg = ""
@@ -786,9 +939,13 @@ class Rx:
         elif self.modulation == "ASK4_GRAY":
             print("Pilotos:    4 niveles × 4 pilotos = 16 pilotos")
             print(f"ASK4_REPEAT: {ASK4_REPEAT}")
+        elif self.modulation == "CSK_RGB":
+            print("Pilotos:    4 colores calibrados por cámara")
+            print(f"CSK_REPEAT: {CSK_REPEAT}")
         else:
-            print("Pilotos:    compatibles con OOK y ASK4")
+            print("Pilotos:    compatibles con OOK, ASK4 y CSK/RGB")
             print(f"ASK4_REPEAT: {ASK4_REPEAT}")
+            print(f"CSK_REPEAT: {CSK_REPEAT}")
 
         if ENABLE_BER_EVALUATION:
             print("BER:        habilitado contra texto de referencia local")
@@ -886,6 +1043,15 @@ class Rx:
                     f"T12={th['T12']:.2f}, "
                     f"T23={th['T23']:.2f}"
                 )
+
+            elif active_mod == "CSK_RGB":
+                print("\nCalibración CSK/RGB por pilotos de color:")
+                cm = c.get("color_level_means")
+                if cm is not None:
+                    for level, name in [(0, "rojo"), (1, "verde"), (2, "azul"), (3, "amarillo")]:
+                        b, g, r = cm[level]
+                        print(f"  Nivel {level} ({name}): B={b:.1f}, G={g:.1f}, R={r:.1f}")
+                print(f"  Umbral binario cabecera: {c['binary_threshold']:.2f}")
 
             else:
                 print("\nCalibración por pilotos:")
@@ -1016,7 +1182,7 @@ class Rx:
 
         warp_gray = cv2.cvtColor(warp, cv2.COLOR_BGR2GRAY)
 
-        cell_means, binary_bits, calibration = read_symbol_cells(warp_gray, border=0)
+        cell_means, color_means, binary_bits, calibration = read_symbol_cells(warp_gray, warp_bgr=warp, border=0)
         self._last_calibration = calibration
 
         # Firma simple para estabilidad.
@@ -1036,6 +1202,7 @@ class Rx:
         if self._stable_count >= self._required_stable:
             parsed = parse_and_decode_frame(
                 cell_means,
+                color_means,
                 binary_bits,
                 calibration,
                 self.modulation
@@ -1286,6 +1453,7 @@ if __name__ == "__main__":
     print("Para pruebas formales usa modo forzado:")
     print("  python rx.py OOK_MANCHESTER")
     print("  python rx.py ASK4_GRAY")
+    print("  python rx.py CSK_RGB")
     print("=" * 70)
     print("")
 
