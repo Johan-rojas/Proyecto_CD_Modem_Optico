@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-# ─────────────────────────── CONFIGURACIÓN DE TX LONG RANGE ─────────────────────────────
+# ─────────────────────────── CONFIGURACIÓN DE TX ─────────────────────────────
 # Modos disponibles:
 #   OOK_MANCHESTER  → modo principal estable
 #   ASK4_GRAY       → segunda modulación física con repetición espacial
@@ -21,12 +21,12 @@ import numpy as np
 #   python tx_final.py CSK_RGB
 MODULATION = "OOK_MANCHESTER"
 
-SYMBOL_SIZE = 30
+SYMBOL_SIZE = 40
 
 # Delay por modulación
 TX_DELAY_OOK = 0.10
 TX_DELAY_ASK4 = 0.10
-TX_DELAY_CSK = 0.10
+TX_DELAY_CSK = 0.15
 
 FULLSCREEN = True
 
@@ -41,8 +41,8 @@ RUN_DIGITAL_LOOPBACK_TEST = False
 ASK4_REPEAT = 3
 
 # Repetición espacial para CSK/RGB.
-# 2 = mayor robustez para largo alcance; para máxima velocidad se puede usar 1.
-CSK_REPEAT = 2
+# 1 = máxima velocidad; si la cámara confunde colores, se puede subir a 2.
+CSK_REPEAT = 1
 
 
 # ─────────────────────────── TEXTO DE PRUEBA ─────────────────────────────────
@@ -196,7 +196,7 @@ class Tx:
     )
 
     # Fiduciales
-    FID_SIZE = 5
+    FID_SIZE = 7
     QUIET = 1
     BORDER = 2
 
@@ -209,23 +209,21 @@ class Tx:
     # Pilotos de 4 niveles.
     # Deben coincidir exactamente con rx.py.
     PILOT_LEVEL_POSITIONS = {
-        # Versión long range 30×30.
-        # Pilotos alejados de fiduciales y ubicados en zonas internas.
         0: [
-            (7, 7), (22, 22),
-            (9, 15), (15, 9),
+            (8, 8), (31, 31),
+            (10, 20), (20, 10),
         ],
         1: [
-            (7, 8), (22, 21),
-            (10, 15), (15, 10),
+            (8, 9), (31, 30),
+            (11, 20), (20, 11),
         ],
         2: [
-            (7, 22), (22, 7),
-            (20, 15), (15, 20),
+            (8, 30), (31, 9),
+            (28, 20), (20, 28),
         ],
         3: [
-            (7, 23), (22, 6),
-            (21, 15), (15, 21),
+            (8, 31), (31, 8),
+            (29, 20), (20, 29),
         ],
     }
 
@@ -346,16 +344,9 @@ class Tx:
 
     # ─────────────────────────── ESPACIAL ─────────────────────────────────────
     def _patron_fiducial(self) -> np.ndarray:
-        # Patrón dinámico compatible con FID_SIZE=5 y FID_SIZE=7:
-        # borde negro, anillo blanco y centro negro.
         f = np.zeros((self.FID_SIZE, self.FID_SIZE), dtype=float)
-
-        if self.FID_SIZE < 5:
-            raise ValueError("FID_SIZE debe ser al menos 5.")
-
-        f[1:self.FID_SIZE - 1, 1:self.FID_SIZE - 1] = 1.0
-        f[2:self.FID_SIZE - 2, 2:self.FID_SIZE - 2] = 0.0
-
+        f[1:6, 1:6] = 1.0
+        f[2:5, 2:5] = 0.0
         return f
 
     def _all_pilot_positions(self) -> list[tuple[int, int]]:

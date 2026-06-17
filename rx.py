@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 
-# ─────────────────────────── CONFIGURACIÓN GENERAL LONG RANGE ───────────────────────────
+# ─────────────────────────── CONFIGURACIÓN GENERAL ───────────────────────────
 # Modos:
 #   AUTO
 #   OOK_MANCHESTER
@@ -22,8 +22,8 @@ import numpy as np
 #   python rx.py AUTO
 RX_MODULATION = "AUTO"
 
-SYMBOL_SIZE = 30
-FID_SIZE = 5
+SYMBOL_SIZE = 40
+FID_SIZE = 7
 QUIET_INNER = 1
 BORDER = 2
 FQ = FID_SIZE + QUIET_INNER
@@ -43,16 +43,21 @@ REQUIRED_STABLE = 1
 DEBUG_VERBOSE = False
 PRINT_INVALID_FRAMES = False
 PRINT_CRC_ERRORS = False
-SAVE_DEBUG_IMAGE = True
+SAVE_DEBUG_IMAGE = False
 PRINT_FPS_EVERY_SECOND = False
+
+# Muestreo robusto del centro de cada celda.
+# Mantiene la version estable 40x40, pero reduce ruido de bordes/reflejos.
+CELL_CENTER_MARGIN_FRACTION = 0.22
+CELL_STATISTIC = "TRIMMED_MEAN"  # opciones: MEAN, MEDIAN, TRIMMED_MEAN
+COLOR_STATISTIC = "MEDIAN"      # opciones: MEAN, MEDIAN
 
 ENABLE_BER_EVALUATION = True
 
 ASK4_REPEAT = 3
 
-# Repetición espacial para CSK/RGB. Debe coincidir con tx_final_long_range.py.
-# 2 = mayor robustez para pruebas a 2 m; para máxima velocidad se puede usar 1.
-CSK_REPEAT = 2
+# Repetición espacial para CSK/RGB. Debe coincidir con tx_final.py.
+CSK_REPEAT = 1
 
 EXPECTED_TEXT = (
     "La vision artificial permite interpretar imagenes mediante algoritmos "
@@ -73,23 +78,21 @@ VALID_RX_MODULATIONS = {
 
 # Pilotos de 4 niveles. Deben coincidir con tx_final.py.
 PILOT_LEVEL_POSITIONS = {
-    # Versión long range 30×30.
-    # Deben coincidir exactamente con tx_final_long_range.py.
     0: [
-        (7, 7), (22, 22),
-        (9, 15), (15, 9),
+        (8, 8), (31, 31),
+        (10, 20), (20, 10),
     ],
     1: [
-        (7, 8), (22, 21),
-        (10, 15), (15, 10),
+        (8, 9), (31, 30),
+        (11, 20), (20, 11),
     ],
     2: [
-        (7, 22), (22, 7),
-        (20, 15), (15, 20),
+        (8, 30), (31, 9),
+        (28, 20), (20, 28),
     ],
     3: [
-        (7, 23), (22, 6),
-        (21, 15), (15, 21),
+        (8, 31), (31, 8),
+        (29, 20), (20, 29),
     ],
 }
 
@@ -589,7 +592,7 @@ def parse_and_decode_frame(cell_means: list[float], color_means: list[np.ndarray
 _debug_saved = False
 
 
-def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> float:
+def _center_patch(img, row: int, col: int, cell_px: float, border: int = 0):
     r_cell = row + border
     c_cell = col + border
 
@@ -598,43 +601,51 @@ def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> 
     c0 = int(c_cell * cell_px)
     c1 = int((c_cell + 1) * cell_px)
 
-    margin_r = max(1, (r1 - r0) // 5)
-    margin_c = max(1, (c1 - c0) // 5)
+    margin_r = max(1, int((r1 - r0) * CELL_CENTER_MARGIN_FRACTION))
+    margin_c = max(1, int((c1 - c0) * CELL_CENTER_MARGIN_FRACTION))
 
-    patch = gray_img[
+    patch = img[
         r0 + margin_r:r1 - margin_r,
         c0 + margin_c:c1 - margin_c
     ]
+
+    return patch
+
+
+def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> float:
+    patch = _center_patch(gray_img, row, col, cell_px, border)
 
     if patch.size == 0:
         return 0.0
 
-    return float(patch.mean())
+    values = patch.astype(np.float32).ravel()
 
+    if CELL_STATISTIC == "MEDIAN":
+        return float(np.median(values))
 
+    if CELL_STATISTIC == "TRIMMED_MEAN" and values.size >= 10:
+        lo = np.percentile(values, 10)
+        hi = np.percentile(values, 90)
+        trimmed = values[(values >= lo) & (values <= hi)]
+        if trimmed.size > 0:
+            return float(trimmed.mean())
+
+    return float(values.mean())
 
 
 def cell_color_mean(bgr_img, row: int, col: int, cell_px: float, border: int = 0) -> np.ndarray:
-    r_cell = row + border
-    c_cell = col + border
-
-    r0 = int(r_cell * cell_px)
-    r1 = int((r_cell + 1) * cell_px)
-    c0 = int(c_cell * cell_px)
-    c1 = int((c_cell + 1) * cell_px)
-
-    margin_r = max(1, (r1 - r0) // 5)
-    margin_c = max(1, (c1 - c0) // 5)
-
-    patch = bgr_img[
-        r0 + margin_r:r1 - margin_r,
-        c0 + margin_c:c1 - margin_c
-    ]
+    patch = _center_patch(bgr_img, row, col, cell_px, border)
 
     if patch.size == 0:
         return np.zeros(3, dtype=float)
 
-    return patch.reshape(-1, 3).mean(axis=0).astype(float)
+    values = patch.reshape(-1, 3).astype(np.float32)
+
+    if COLOR_STATISTIC == "MEDIAN":
+        return np.median(values, axis=0).astype(float)
+
+    return values.mean(axis=0).astype(float)
+
 
 def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0, warp_bgr=None):
     level_means = {}
@@ -921,6 +932,15 @@ class Rx:
         self.cap.set(cv2.CAP_PROP_GAIN, 34)
         self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
         self.cap.set(cv2.CAP_PROP_FOCUS, 0)
+
+        # Congela balance de blancos si la cámara lo soporta.
+        # Esto ayuda especialmente a CSK_RGB, porque evita que la cámara cambie
+        # la mezcla de colores durante la transmisión.
+        try:
+            self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+            self.cap.set(cv2.CAP_PROP_WB_TEMPERATURE, 4500)
+        except Exception:
+            pass
 
         for _ in range(5):
             self.cap.read()
