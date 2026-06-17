@@ -33,7 +33,7 @@ CAMERA_HEIGHT = 1080
 CAMERA_FPS = 30
 
 WARP_SIZE = 800
-PROCESS_SCALE = 1
+PROCESS_SCALE = 1.5
 
 # OOK funciona bien con 1.
 # ASK4 es más delicado. La robustez la da ASK4_REPEAT, pero dejamos estabilidad en 1
@@ -43,14 +43,28 @@ REQUIRED_STABLE = 1
 DEBUG_VERBOSE = False
 PRINT_INVALID_FRAMES = False
 PRINT_CRC_ERRORS = False
-SAVE_DEBUG_IMAGE = False
+SAVE_DEBUG_IMAGE = True
 PRINT_FPS_EVERY_SECOND = False
 
-# Muestreo robusto del centro de cada celda.
-# Mantiene la version estable 40x40, pero reduce ruido de bordes/reflejos.
-CELL_CENTER_MARGIN_FRACTION = 0.22
-CELL_STATISTIC = "TRIMMED_MEAN"  # opciones: MEAN, MEDIAN, TRIMMED_MEAN
-COLOR_STATISTIC = "MEDIAN"      # opciones: MEAN, MEDIAN
+# Ajustes experimentales para 2 m.
+# Se procesa una región central-inferior donde debe estar la pantalla del TX,
+# y se escala para detectar fiduciales pequeños con más estabilidad.
+USE_DETECTION_ROI = True
+ROI_X0 = 0.12
+ROI_Y0 = 0.18
+ROI_X1 = 0.92
+ROI_Y1 = 0.94
+
+# Cámara: se intenta enfocar al inicio y luego congelar el foco.
+# Si la cámara ignora estas propiedades, OpenCV simplemente continúa.
+ENABLE_AUTOFOCUS_STARTUP = True
+AUTOFOCUS_WARMUP_FRAMES = 25
+FREEZE_FOCUS_AFTER_STARTUP = True
+FOCUS_FALLBACK_VALUE = 0
+CAMERA_EXPOSURE_VALUE = -7
+CAMERA_BRIGHTNESS_VALUE = 80
+CAMERA_CONTRAST_VALUE = 150
+CAMERA_GAIN_VALUE = 20
 
 ENABLE_BER_EVALUATION = True
 
@@ -592,7 +606,7 @@ def parse_and_decode_frame(cell_means: list[float], color_means: list[np.ndarray
 _debug_saved = False
 
 
-def _center_patch(img, row: int, col: int, cell_px: float, border: int = 0):
+def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> float:
     r_cell = row + border
     c_cell = col + border
 
@@ -601,51 +615,43 @@ def _center_patch(img, row: int, col: int, cell_px: float, border: int = 0):
     c0 = int(c_cell * cell_px)
     c1 = int((c_cell + 1) * cell_px)
 
-    margin_r = max(1, int((r1 - r0) * CELL_CENTER_MARGIN_FRACTION))
-    margin_c = max(1, int((c1 - c0) * CELL_CENTER_MARGIN_FRACTION))
+    margin_r = max(1, (r1 - r0) // 5)
+    margin_c = max(1, (c1 - c0) // 5)
 
-    patch = img[
+    patch = gray_img[
         r0 + margin_r:r1 - margin_r,
         c0 + margin_c:c1 - margin_c
     ]
 
-    return patch
-
-
-def cell_mean(gray_img, row: int, col: int, cell_px: float, border: int = 0) -> float:
-    patch = _center_patch(gray_img, row, col, cell_px, border)
-
     if patch.size == 0:
         return 0.0
 
-    values = patch.astype(np.float32).ravel()
+    return float(patch.mean())
 
-    if CELL_STATISTIC == "MEDIAN":
-        return float(np.median(values))
 
-    if CELL_STATISTIC == "TRIMMED_MEAN" and values.size >= 10:
-        lo = np.percentile(values, 10)
-        hi = np.percentile(values, 90)
-        trimmed = values[(values >= lo) & (values <= hi)]
-        if trimmed.size > 0:
-            return float(trimmed.mean())
-
-    return float(values.mean())
 
 
 def cell_color_mean(bgr_img, row: int, col: int, cell_px: float, border: int = 0) -> np.ndarray:
-    patch = _center_patch(bgr_img, row, col, cell_px, border)
+    r_cell = row + border
+    c_cell = col + border
+
+    r0 = int(r_cell * cell_px)
+    r1 = int((r_cell + 1) * cell_px)
+    c0 = int(c_cell * cell_px)
+    c1 = int((c_cell + 1) * cell_px)
+
+    margin_r = max(1, (r1 - r0) // 5)
+    margin_c = max(1, (c1 - c0) // 5)
+
+    patch = bgr_img[
+        r0 + margin_r:r1 - margin_r,
+        c0 + margin_c:c1 - margin_c
+    ]
 
     if patch.size == 0:
         return np.zeros(3, dtype=float)
 
-    values = patch.reshape(-1, 3).astype(np.float32)
-
-    if COLOR_STATISTIC == "MEDIAN":
-        return np.median(values, axis=0).astype(float)
-
-    return values.mean(axis=0).astype(float)
-
+    return patch.reshape(-1, 3).mean(axis=0).astype(float)
 
 def estimate_calibration_with_pilots(warp_gray, cell_px: float, border: int = 0, warp_bgr=None):
     level_means = {}
@@ -926,13 +932,12 @@ class Rx:
             self.cap.read()
 
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-        self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 113)
-        self.cap.set(cv2.CAP_PROP_CONTRAST, 128)
-        self.cap.set(cv2.CAP_PROP_GAIN, 34)
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, CAMERA_EXPOSURE_VALUE)
+        self.cap.set(cv2.CAP_PROP_BRIGHTNESS, CAMERA_BRIGHTNESS_VALUE)
+        self.cap.set(cv2.CAP_PROP_CONTRAST, CAMERA_CONTRAST_VALUE)
+        self.cap.set(cv2.CAP_PROP_GAIN, CAMERA_GAIN_VALUE)
 
-        # Para 2 m conviene dejar que la cámara enfoque la pantalla real
-        # al iniciar; luego se congela para que no varíe durante la transmisión.
+        # Autofocus inicial para distancia larga. Luego se congela para evitar deriva.
         try:
             if ENABLE_AUTOFOCUS_STARTUP:
                 self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
@@ -942,20 +947,18 @@ class Rx:
                     self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
             else:
                 self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+                self.cap.set(cv2.CAP_PROP_FOCUS, FOCUS_FALLBACK_VALUE)
         except Exception:
             pass
 
-        try:
-            self.cap.set(cv2.CAP_PROP_SHARPNESS, 255)
-        except Exception:
-            pass
-
-        # Congela balance de blancos si la cámara lo soporta.
-        # Esto ayuda especialmente a CSK_RGB, porque evita que la cámara cambie
-        # la mezcla de colores durante la transmisión.
+        # Si lo soporta, congelamos balance de blancos y subimos nitidez.
         try:
             self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
             self.cap.set(cv2.CAP_PROP_WB_TEMPERATURE, 4500)
+        except Exception:
+            pass
+        try:
+            self.cap.set(cv2.CAP_PROP_SHARPNESS, 255)
         except Exception:
             pass
 
@@ -1141,8 +1144,27 @@ class Rx:
     def process_frame(self, frame):
         debug = frame.copy()
 
+        # Para 2 m conviene eliminar objetos externos y ampliar la zona donde está
+        # la pantalla. Esto no cambia la geometría real: solo mejora la detección.
+        offset = np.array([0, 0], dtype=np.float32)
+        frame_for_detection = frame
+
+        if USE_DETECTION_ROI:
+            H0, W0 = frame.shape[:2]
+            x0 = int(W0 * ROI_X0)
+            y0 = int(H0 * ROI_Y0)
+            x1 = int(W0 * ROI_X1)
+            y1 = int(H0 * ROI_Y1)
+            x0 = max(0, min(W0 - 2, x0))
+            y0 = max(0, min(H0 - 2, y0))
+            x1 = max(x0 + 2, min(W0, x1))
+            y1 = max(y0 + 2, min(H0, y1))
+            frame_for_detection = frame[y0:y1, x0:x1]
+            offset = np.array([x0, y0], dtype=np.float32)
+            cv2.rectangle(debug, (x0, y0), (x1, y1), (80, 80, 255), 1)
+
         scaled = cv2.resize(
-            frame,
+            frame_for_detection,
             None,
             fx=self.scale,
             fy=self.scale,
@@ -1178,7 +1200,6 @@ class Rx:
             return debug, None, self._decoded_text
 
         fiducials = detect_fiducials(bw, contours, hierarchy)
-        offset = np.array([0, 0], dtype=np.float32)
 
         for f in fiducials:
             box_orig = (f["box"] / self.scale + offset).astype(np.int32)

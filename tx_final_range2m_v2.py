@@ -23,10 +23,15 @@ MODULATION = "OOK_MANCHESTER"
 
 SYMBOL_SIZE = 40
 
-# Delay por modulación
-TX_DELAY_OOK = 0.15
-TX_DELAY_ASK4 = 0.15
-TX_DELAY_CSK = 0.15
+# Versión experimental de alcance: se conserva 40×40 para no perder velocidad,
+# pero se reduce brillo visual y se usan fiduciales más grandes.
+TX_WHITE_LEVEL = 0.86
+TX_COLOR_GAIN = 0.88
+
+# Delay por modulación. A 2 m conviene sostener un poco más cada trama.
+TX_DELAY_OOK = 0.16
+TX_DELAY_ASK4 = 0.16
+TX_DELAY_CSK = 0.16
 
 FULLSCREEN = True
 
@@ -210,20 +215,20 @@ class Tx:
     # Deben coincidir exactamente con rx.py.
     PILOT_LEVEL_POSITIONS = {
         0: [
-            (11, 11), (28, 28),
-            (13, 20), (20, 13),
+            (8, 8), (31, 31),
+            (10, 20), (20, 10),
         ],
         1: [
-            (11, 12), (28, 27),
-            (14, 20), (20, 14),
+            (8, 9), (31, 30),
+            (11, 20), (20, 11),
         ],
         2: [
-            (11, 28), (28, 11),
-            (26, 20), (20, 26),
+            (8, 30), (31, 9),
+            (28, 20), (20, 28),
         ],
         3: [
-            (11, 29), (28, 10),
-            (27, 20), (20, 27),
+            (8, 31), (31, 8),
+            (29, 20), (20, 29),
         ],
     }
 
@@ -269,11 +274,13 @@ class Tx:
 
     # Matplotlib interpreta imágenes RGB.
     CSK_LEVEL_VALUES = {
-        0: np.array([1.0, 0.0, 0.0], dtype=float),  # rojo
-        1: np.array([0.0, 1.0, 0.0], dtype=float),  # verde
-        2: np.array([0.0, 0.0, 1.0], dtype=float),  # azul
-        3: np.array([1.0, 1.0, 0.0], dtype=float),  # amarillo
+        0: np.array([TX_COLOR_GAIN, 0.0, 0.0], dtype=float),  # rojo
+        1: np.array([0.0, TX_COLOR_GAIN, 0.0], dtype=float),  # verde
+        2: np.array([0.0, 0.0, TX_COLOR_GAIN], dtype=float),  # azul
+        3: np.array([TX_COLOR_GAIN, TX_COLOR_GAIN, 0.0], dtype=float),  # amarillo
     }
+
+    WHITE_LEVEL = TX_WHITE_LEVEL
 
     def __init__(
         self,
@@ -344,18 +351,15 @@ class Tx:
 
     # ─────────────────────────── ESPACIAL ─────────────────────────────────────
     def _patron_fiducial(self) -> np.ndarray:
+        """Patrón fiducial dinámico: borde negro, anillo claro y centro negro.
+        Con FID_SIZE=9 se ve mejor a mayor distancia que el patrón 7×7.
         """
-        Fiducial dinámico tipo anillo negro/blanco/negro.
-        Para la versión 2 m se usa FID_SIZE=9, más visible desde lejos.
-        """
-        f = np.zeros((self.FID_SIZE, self.FID_SIZE), dtype=float)
-        f[1:self.FID_SIZE - 1, 1:self.FID_SIZE - 1] = 1.0
-
-        center_margin = max(2, self.FID_SIZE // 3)
-        f[
-            center_margin:self.FID_SIZE - center_margin,
-            center_margin:self.FID_SIZE - center_margin,
-        ] = 0.0
+        n = self.FID_SIZE
+        f = np.zeros((n, n), dtype=float)
+        f[1:n - 1, 1:n - 1] = self.WHITE_LEVEL
+        inner = max(2, n // 3)
+        start = (n - inner) // 2
+        f[start:start + inner, start:start + inner] = 0.0
         return f
 
     def _all_pilot_positions(self) -> list[tuple[int, int]]:
@@ -408,7 +412,7 @@ class Tx:
             (N - FQ, 0, self.QUIET, 0),
             (N - FQ, N - FQ, self.QUIET, self.QUIET),
         ]:
-            symbol[r0:r0 + FQ, c0:c0 + FQ] = 1.0
+            symbol[r0:r0 + FQ, c0:c0 + FQ] = self.WHITE_LEVEL
 
             if symbol.ndim == 3:
                 symbol[
@@ -426,7 +430,7 @@ class Tx:
         if self.modulation == "OOK_MANCHESTER":
             # En OOK usamos los pilotos como referencia binaria:
             # niveles 0 y 1 negros, niveles 2 y 3 blancos.
-            return 0.0 if level in (0, 1) else 1.0
+            return 0.0 if level in (0, 1) else self.WHITE_LEVEL
 
         if self.modulation == "ASK4_GRAY":
             return self.ASK4_LEVEL_VALUES[level]
@@ -618,15 +622,15 @@ class Tx:
 
             if self.modulation == "OOK_MANCHESTER":
                 payload_cells = self._manchester_encode(real_bits)
-                pad_value = 1.0
+                pad_value = self.WHITE_LEVEL
 
             elif self.modulation == "ASK4_GRAY":
                 payload_cells = self._ask4_encode(real_bits, self.ask4_repeat)
-                pad_value = 1.0
+                pad_value = self.WHITE_LEVEL
 
             elif self.modulation == "CSK_RGB":
                 payload_cells = self._csk_encode(real_bits, self.csk_repeat)
-                pad_value = np.array([1.0, 1.0, 1.0], dtype=float)
+                pad_value = np.array([self.WHITE_LEVEL, self.WHITE_LEVEL, self.WHITE_LEVEL], dtype=float)
 
             else:
                 raise RuntimeError("Modulación no reconocida.")
@@ -665,26 +669,27 @@ class Tx:
 
         for frame_cells in frames:
             if self.modulation == "CSK_RGB":
-                symbol = np.ones((N, N, 3), dtype=float)
+                symbol = np.full((N, N, 3), self.WHITE_LEVEL, dtype=float)
             else:
-                symbol = np.ones((N, N), dtype=float)
+                symbol = np.full((N, N), self.WHITE_LEVEL, dtype=float)
 
             for (r, c), value in zip(self._data_positions, frame_cells):
                 if self.modulation == "CSK_RGB" and isinstance(value, np.ndarray):
                     symbol[r, c, :] = value
                 elif self.modulation == "CSK_RGB":
-                    symbol[r, c, :] = float(value)
+                    symbol[r, c, :] = self.WHITE_LEVEL if float(value) >= 0.99 else float(value)
                 else:
-                    symbol[r, c] = float(value)
+                    v = float(value)
+                    symbol[r, c] = self.WHITE_LEVEL if v >= 0.99 else v
 
             self._draw_fiducials(symbol)
             self._draw_pilots(symbol)
 
             if self.modulation == "CSK_RGB":
-                bordered = np.ones((N + 2 * B, N + 2 * B, 3), dtype=float)
+                bordered = np.full((N + 2 * B, N + 2 * B, 3), self.WHITE_LEVEL, dtype=float)
                 bordered[B:B + N, B:B + N, :] = symbol
             else:
-                bordered = np.ones((N + 2 * B, N + 2 * B), dtype=float)
+                bordered = np.full((N + 2 * B, N + 2 * B), self.WHITE_LEVEL, dtype=float)
                 bordered[B:B + N, B:B + N] = symbol
 
             imgs.append(bordered)
