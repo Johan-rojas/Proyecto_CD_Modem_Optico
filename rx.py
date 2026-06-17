@@ -51,7 +51,7 @@ ENABLE_BER_EVALUATION = True
 ASK4_REPEAT = 3
 
 # Repetición espacial para CSK/RGB. Debe coincidir con tx_final.py.
-CSK_REPEAT = 1
+CSK_REPEAT = 2
 
 EXPECTED_TEXT = (
     "La vision artificial permite interpretar imagenes mediante algoritmos "
